@@ -574,15 +574,28 @@ func (t *GroupTree) Flatten() []Item {
 		// Calculate group nesting level from path
 		groupLevel := GetGroupLevel(group.Path)
 
-		// Check if parent group is collapsed - if so, skip this group
+		// Check if any ancestor group is collapsed - if so, skip this group.
+		// Must walk the full ancestor chain, not just the immediate parent:
+		// collapsing a top-level group does not cascade Expanded=false down to
+		// its children, so a 3+-level-deep group whose direct parent is still
+		// Expanded=true would otherwise leak through a collapsed grandparent.
 		if groupLevel > 0 {
-			idx := strings.LastIndex(group.Path, "/")
-			if idx == -1 {
-				continue // Malformed path, skip
+			path := group.Path
+			ancestorCollapsed := false
+			for {
+				idx := strings.LastIndex(path, "/")
+				if idx == -1 {
+					break
+				}
+				parentPath := path[:idx]
+				if parentGroup, exists := t.Groups[parentPath]; exists && !parentGroup.Expanded {
+					ancestorCollapsed = true
+					break
+				}
+				path = parentPath
 			}
-			parentPath := group.Path[:idx]
-			if parentGroup, exists := t.Groups[parentPath]; exists && !parentGroup.Expanded {
-				continue // Parent is collapsed, skip this subgroup
+			if ancestorCollapsed {
+				continue // An ancestor is collapsed, skip this subgroup
 			}
 		}
 

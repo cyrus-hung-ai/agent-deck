@@ -255,6 +255,39 @@ func TestFlattenWithNestedGroupsCollapsed(t *testing.T) {
 	}
 }
 
+// TestFlattenWithThreeLevelNestingCollapsed guards against a regression where
+// Flatten only checked a group's immediate parent's Expanded flag instead of
+// walking the full ancestor chain. Collapsing a top-level group does not
+// cascade Expanded=false down to its children, so a grandchild whose direct
+// parent is still Expanded=true would incorrectly render even though a
+// higher ancestor is collapsed (reported 2026-08-06: a main group minimized
+// while a sub-subgroup stayed expanded still leaked its sessions through).
+func TestFlattenWithThreeLevelNestingCollapsed(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	tree.CreateGroup("Main")
+	tree.CreateSubgroup("Main", "Sub")
+	tree.CreateSubgroup("Main/Sub", "SubSub")
+
+	tree.Groups["Main/Sub/SubSub"].Sessions = []*Instance{{ID: "1", GroupPath: "Main/Sub/SubSub"}}
+
+	// Sub and SubSub stay expanded; only the top-level Main gets collapsed.
+	tree.ExpandGroup("Main/Sub")
+	tree.ExpandGroup("Main/Sub/SubSub")
+	tree.CollapseGroup("Main")
+
+	items := tree.Flatten()
+
+	// Only "Main"'s own group header should be visible - Sub, SubSub, and the
+	// session nested three levels down must all be hidden.
+	if len(items) != 1 {
+		t.Errorf("Expected 1 item when top-level ancestor collapsed (Sub/SubSub still marked expanded), got %d", len(items))
+		for _, it := range items {
+			t.Logf("  leaked item: type=%v path=%v", it.Type, it.Path)
+		}
+	}
+}
+
 // TestSubgroupSortingWithUnrelatedRoots verifies that subgroups stay with their
 // parent root and are not sorted between unrelated root groups.
 // This was a bug where "agent-deck/github-issues" would sort between "My Sessions"
