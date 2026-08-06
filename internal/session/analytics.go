@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -75,12 +76,18 @@ var modelContextWindowPrefixes = []struct {
 	prefix string
 	size   int
 }{
+	// 5.x models: 1M context (must precede 4.x fallback)
+	{"claude-opus-5", 1000000},
+	{"claude-sonnet-5", 1000000},
+	{"claude-fable-5", 1000000},
+	// 4.8 models: 1M context (must precede 4.x fallback)
+	{"claude-opus-4-8", 1000000},
 	// 4.7 models: 1M context (must precede 4.x fallback)
 	{"claude-opus-4-7", 1000000},
 	// 4.6 models: 1M context
 	{"claude-opus-4-6", 1000000},
 	{"claude-sonnet-4-6", 1000000},
-	// 4.x models (non-4.6/4.7): 200k context
+	// 4.x models (non-4.6/4.7/4.8): 200k context
 	{"claude-opus-4", 200000},
 	{"claude-sonnet-4", 200000},
 	{"claude-haiku-4", 200000},
@@ -92,18 +99,85 @@ var modelContextWindowPrefixes = []struct {
 	{"MiniMax-M2.7", 204800},           // 204.8K context
 	{"MiniMax-M2.5-highspeed", 204000}, // 204K context (must precede M2.5)
 	{"MiniMax-M2.5", 204000},           // 204K context
+	// Pi (earendil-works/pi) models — fallback prefixes when the exact window
+	// is not found in ~/.pi/agent/models.json (see piModelContextWindow).
+	// Windows from models.json as of 2026-08.
+	{"gpt-5", 1050000},           // GPT-5.5 / 5.6 (Sol/Luna/Terra): ~1.05M
+	{"glm-5", 1048576},           // GLM-5.2: 1M
+	{"auto", 1000000},            // Auto / Auto V3/V4 family: ~1M
+	{"fusion-frontier", 1000000}, // Fusion Frontier: 1M
 }
 
 // contextWindowForModel returns the context window size for a model ID.
-// Returns on first prefix match; entries are ordered most-specific first
+// It first consults pi's models.json (exact ID match — authoritative for pi
+// sessions), then falls back to the prefix table, then the 200k Claude default.
+// Entries in the prefix table are ordered most-specific first
 // (e.g. "claude-sonnet-4-6" before "claude-sonnet-4") to ensure correct resolution.
 func contextWindowForModel(model string) int {
+	if size, ok := piModelContextWindow(model); ok {
+		return size
+	}
 	for _, entry := range modelContextWindowPrefixes {
 		if len(model) >= len(entry.prefix) && model[:len(entry.prefix)] == entry.prefix {
 			return entry.size
 		}
 	}
 	return 200000 // Default Claude limit
+}
+
+// piModelWindowCache caches the model-id -> contextWindow map parsed from
+// ~/.pi/agent/models.json. The file is small and changes rarely; reload it
+// only when its mtime changes.
+var (
+	piModelWindowMu         sync.Mutex
+	piModelWindowCache      map[string]int
+	piModelWindowCacheMtime time.Time
+)
+
+// piModelContextWindow looks up a model's context window from pi's
+// ~/.pi/agent/models.json (the source of truth for pi models). Returns
+// (0, false) when the file is missing/unreadable or the model is unknown.
+func piModelContextWindow(model string) (int, bool) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0, false
+	}
+	path := home + "/.pi/agent/models.json"
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	piModelWindowMu.Lock()
+	defer piModelWindowMu.Unlock()
+	if piModelWindowCache == nil || !info.ModTime().Equal(piModelWindowCacheMtime) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return 0, false
+		}
+		var doc struct {
+			Providers map[string]struct {
+				Models []struct {
+					ID            string `json:"id"`
+					ContextWindow int    `json:"contextWindow"`
+				} `json:"models"`
+			} `json:"providers"`
+		}
+		if err := json.Unmarshal(data, &doc); err != nil {
+			return 0, false
+		}
+		cache := make(map[string]int)
+		for _, prov := range doc.Providers {
+			for _, m := range prov.Models {
+				if m.ID != "" && m.ContextWindow > 0 {
+					cache[m.ID] = m.ContextWindow
+				}
+			}
+		}
+		piModelWindowCache = cache
+		piModelWindowCacheMtime = info.ModTime()
+	}
+	size, ok := piModelWindowCache[model]
+	return size, ok
 }
 
 // ContextPercent returns the percentage of context window used

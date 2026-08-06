@@ -66,6 +66,12 @@ func TestContextWindowForModel(t *testing.T) {
 	// 4.6 models: 1M
 	assert.Equal(t, 1000000, contextWindowForModel("claude-opus-4-6"))
 	assert.Equal(t, 1000000, contextWindowForModel("claude-sonnet-4-6"))
+	// 4.8 models: 1M
+	assert.Equal(t, 1000000, contextWindowForModel("claude-opus-4-8"))
+	// 5.x models: 1M
+	assert.Equal(t, 1000000, contextWindowForModel("claude-opus-5"))
+	assert.Equal(t, 1000000, contextWindowForModel("claude-sonnet-5"))
+	assert.Equal(t, 1000000, contextWindowForModel("claude-fable-5"))
 	// 4.x non-4.6/4.7 models: 200k
 	assert.Equal(t, 200000, contextWindowForModel("claude-opus-4-20250514"))
 	assert.Equal(t, 200000, contextWindowForModel("claude-sonnet-4-20250514"))
