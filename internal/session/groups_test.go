@@ -1055,6 +1055,90 @@ func TestMoveGroupNotAcrossLevels(t *testing.T) {
 	}
 }
 
+// TestMoveGroupUpTiedSortOrderInterleaved reproduces the "reorder silently
+// no-ops" bug (handoff 20260806-164022): when sibling sort_order values are
+// tied at the schema default (0) — as a bulk TUI rename leaves them — the
+// hierarchical sort interleaves subgroups BETWEEN siblings in GroupList, so
+// the previous GroupList entry for a sibling is a nephew/child rather than a
+// sibling. The old MoveGroupUp used raw GroupList index adjacency and
+// silently no-op'd ("position 3 → 3"). The fix filters the sibling list and
+// renumbers with distinct sequential Order values.
+func TestMoveGroupUpTiedSortOrderInterleaved(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// Build: Work/{applied3,core-stack,Meta,archive}, each of applied3 and
+	// core-stack having an "on-call" subgroup. Mirror the real tree that broke.
+	tree.CreateGroup("Work")
+	tree.CreateSubgroup("Work", "applied3")
+	tree.CreateSubgroup("Work/applied3", "on-call")
+	tree.CreateSubgroup("Work", "core-stack")
+	tree.CreateSubgroup("Work/core-stack", "on-call")
+	tree.CreateSubgroup("Work", "Meta")
+	tree.CreateSubgroup("Work", "archive")
+
+	// Force the tie state the bulk rename produced: every sibling shares
+	// sort_order 0. (NewGroupTree assigns distinct Orders, so reset them.)
+	for _, g := range tree.GroupList {
+		g.Order = 0
+	}
+	tree.rebuildGroupList()
+
+	// Sanity: with all Orders tied, GroupList is name-sorted, so
+	// Work/core-stack's predecessor in GroupList is Work/applied3/on-call
+	// (a nephew), NOT Work/applied3 (a sibling). That adjacency mismatch is
+	// exactly what made the old swap no-op.
+
+	// core-stack should be able to move up past applied3 despite the tie.
+	// Capture sibling order before.
+	siblingOrderBefore := siblingPaths(tree, "Work")
+
+	tree.MoveGroupUp("Work/core-stack")
+
+	siblingOrderAfter := siblingPaths(tree, "Work")
+
+	// core-stack was the last sibling under the tie (name-sort puts it last);
+	// moving up must advance it exactly one slot. The old code no-op'd here
+	// because GroupList interleaves Work/applied3/on-call between siblings,
+	// so the predecessor was a nephew, not a sibling.
+	beforeIdx := indexOf(siblingOrderBefore, "Work/core-stack")
+	afterIdx := indexOf(siblingOrderAfter, "Work/core-stack")
+	if afterIdx != beforeIdx-1 {
+		t.Errorf("MoveGroupUp no-op'd under tied sort_order: core-stack %d -> %d (expected %d).\nbefore: %v\nafter:  %v", beforeIdx, afterIdx, beforeIdx-1, siblingOrderBefore, siblingOrderAfter)
+	}
+
+	// And the move must have broken the tie: sibling Orders are now distinct.
+	seen := map[int]bool{}
+	for _, g := range tree.GroupList {
+		if getParentPath(g.Path) == "Work" && GetGroupLevel(g.Path) == 1 {
+			if seen[g.Order] {
+				t.Errorf("duplicate Order %d remains among siblings after move: %+v", g.Order, siblingOrderAfter)
+			}
+			seen[g.Order] = true
+		}
+	}
+}
+
+// siblingPaths returns the paths of a group's direct children (same parent,
+// one level deeper) in current GroupList display order.
+func siblingPaths(tree *GroupTree, parentPath string) []string {
+	var out []string
+	for _, g := range tree.GroupList {
+		if getParentPath(g.Path) == parentPath && GetGroupLevel(g.Path) == GetGroupLevel(parentPath)+1 {
+			out = append(out, g.Path)
+		}
+	}
+	return out
+}
+
+func indexOf(s []string, v string) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+	return -1
+}
+
 func TestAddSession(t *testing.T) {
 	tree := NewGroupTree([]*Instance{})
 	tree.CreateGroup("test")

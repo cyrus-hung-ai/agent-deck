@@ -770,40 +770,70 @@ func (t *GroupTree) CollapseGroup(path string) {
 	}
 }
 
-// MoveGroupUp moves a group up in the order (only within siblings at same level)
+// MoveGroupUp moves a group up among its siblings (same parent, same level).
+//
+// It operates on the filtered sibling list rather than raw GroupList index
+// adjacency, and renumbers every sibling with distinct sequential Order
+// values afterward. This is necessary because when sibling sort_order
+// values are tied (e.g. after a bulk rename reset them to the schema default),
+// the hierarchical sort interleaves children between siblings in GroupList,
+// so the previous GroupList entry is often a nephew/child rather than a
+// sibling — which made the old index-adjacency swap silently no-op (the
+// "reorder position 3 → 3" bug). Renumbering also ensures ties can never
+// recur, so subsequent reorders stay robust.
 func (t *GroupTree) MoveGroupUp(path string) {
-	parentPath := getParentPath(path)
-
-	for i, g := range t.GroupList {
-		if g.Path == path && i > 0 {
-			// Only swap if previous item is a sibling (same parent)
-			prevParent := getParentPath(t.GroupList[i-1].Path)
-			if prevParent == parentPath {
-				t.GroupList[i], t.GroupList[i-1] = t.GroupList[i-1], t.GroupList[i]
-				t.GroupList[i].Order = i
-				t.GroupList[i-1].Order = i - 1
-			}
-			break
-		}
-	}
+	t.moveGroup(path, -1)
 }
 
-// MoveGroupDown moves a group down in the order (only within siblings at same level)
+// MoveGroupDown moves a group down among its siblings.
 func (t *GroupTree) MoveGroupDown(path string) {
+	t.moveGroup(path, +1)
+}
+
+// moveGroup moves a group by delta positions (-1 up, +1 down) among its
+// siblings. It filters the sibling list from GroupList (preserving current
+// display order), swaps within that list, renumbers all siblings with
+// sequential Order values, and rebuilds GroupList.
+func (t *GroupTree) moveGroup(path string, delta int) {
+	level := GetGroupLevel(path)
 	parentPath := getParentPath(path)
 
-	for i, g := range t.GroupList {
-		if g.Path == path && i < len(t.GroupList)-1 {
-			// Only swap if next item is a sibling (same parent)
-			nextParent := getParentPath(t.GroupList[i+1].Path)
-			if nextParent == parentPath {
-				t.GroupList[i], t.GroupList[i+1] = t.GroupList[i+1], t.GroupList[i]
-				t.GroupList[i].Order = i
-				t.GroupList[i+1].Order = i + 1
-			}
+	// Collect siblings in current GroupList display order.
+	var siblings []*Group
+	for _, g := range t.GroupList {
+		if getParentPath(g.Path) == parentPath && GetGroupLevel(g.Path) == level {
+			siblings = append(siblings, g)
+		}
+	}
+
+	// Find the target's index among siblings.
+	idx := -1
+	for i, g := range siblings {
+		if g.Path == path {
+			idx = i
 			break
 		}
 	}
+	if idx < 0 {
+		return // not found
+	}
+
+	target := idx + delta
+	if target < 0 || target >= len(siblings) {
+		return // already at the boundary
+	}
+
+	// Swap within the sibling list.
+	siblings[idx], siblings[target] = siblings[target], siblings[idx]
+
+	// Renumber ALL siblings with distinct sequential Orders so the
+	// hierarchical sort is deterministic by Order (not Name), preventing
+	// the interleaved-children no-op from recurring on future reorders.
+	for i, g := range siblings {
+		g.Order = i
+	}
+
+	t.rebuildGroupList()
 }
 
 // MoveSessionUp moves a session up among its visual siblings: top-level
