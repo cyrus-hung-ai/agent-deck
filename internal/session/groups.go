@@ -643,6 +643,32 @@ func (t *GroupTree) Flatten() []Item {
 			// top/bottom of its group immediately — without this, the pin only
 			// takes effect after a restart. Operates on Flatten's local copies,
 			// never the tree's group.Sessions, and preserves unpinned order.
+			//
+			// Recency-mode live re-sort: tree-build only sorts once at load, so
+			// without this a session that just produced output wouldn't bubble up
+			// until a full tree rebuild. Re-sort the display copies here by
+			// RecencyTime desc (then Order as tie-breaker), then let the pin
+			// partition run on top. Other modes (creation/actionable) keep their
+			// load-time order via the stable partition below.
+			if mode := currentGroupSortMode(); mode == "recency" {
+				sort.SliceStable(parentSessions, func(i, j int) bool {
+					ai, aj := parentSessions[i].RecencyTime(), parentSessions[j].RecencyTime()
+					if !ai.Equal(aj) {
+						return ai.After(aj)
+					}
+					return parentSessions[i].Order < parentSessions[j].Order
+				})
+				for parentID := range subSessionsByParent {
+					sort.SliceStable(subSessionsByParent[parentID], func(i, j int) bool {
+						subs := subSessionsByParent[parentID]
+						ai, aj := subs[i].RecencyTime(), subs[j].RecencyTime()
+						if !ai.Equal(aj) {
+							return ai.After(aj)
+						}
+						return subs[i].Order < subs[j].Order
+					})
+				}
+			}
 			stablePinPartition(parentSessions)
 			for parentID := range subSessionsByParent {
 				stablePinPartition(subSessionsByParent[parentID])
