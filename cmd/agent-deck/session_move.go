@@ -151,7 +151,7 @@ func handleSessionMove(profile string, args []string) {
 			targetGroupPath = session.DefaultGroupPath
 		}
 		if _, ok := groupTree.Groups[targetGroupPath]; !ok && targetGroupPath != session.DefaultGroupPath {
-			created := groupTree.CreateGroup(targetGroupPath)
+			created := groupTree.CreateGroupPath(targetGroupPath)
 			targetGroupPath = created.Path
 		}
 		groupTree.MoveSessionToGroup(inst, targetGroupPath)

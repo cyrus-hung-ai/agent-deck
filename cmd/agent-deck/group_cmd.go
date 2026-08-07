@@ -1045,8 +1045,9 @@ func handleGroupMove(profile string, args []string) {
 			}
 		}
 		if !matched {
-			// No existing group found - CreateGroup normalizes the path
-			created := groupTree.CreateGroup(targetGroupPath)
+			// No existing group found - CreateGroupPath splits on '/' to build
+			// nested groups (CreateGroup would flatten '/' to '-', issue #1357).
+			created := groupTree.CreateGroupPath(targetGroupPath)
 			targetGroupPath = created.Path
 		}
 	}

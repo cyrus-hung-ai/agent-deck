@@ -211,9 +211,14 @@ func TestSessionMove_GroupFlag(t *testing.T) {
 	}
 
 	listJSON := readSessionsJSON(t, home)
-	// The group layer sanitizes path separators (`/` → `-`); accept either form.
-	if !strings.Contains(listJSON, "work/frontend") && !strings.Contains(listJSON, "work-frontend") {
-		t.Errorf("session did not move to work/frontend group; list:\n%s", listJSON)
+	// `--group work/frontend` must create a nested group (work/frontend), not
+	// flatten the slash to `work-frontend` (regression: issue #1357 class —
+	// session_move.go called CreateGroup instead of CreateGroupPath).
+	if !strings.Contains(listJSON, "work/frontend") {
+		t.Errorf("session did not move to nested work/frontend group; list:\n%s", listJSON)
+	}
+	if strings.Contains(listJSON, "work-frontend") {
+		t.Errorf("group path was slash-flattened to work-frontend; expected nested work/frontend. list:\n%s", listJSON)
 	}
 }
 
