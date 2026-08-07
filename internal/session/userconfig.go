@@ -1354,11 +1354,11 @@ func (c *UserConfig) GetSyncTitle() bool {
 	return *c.SyncTitle
 }
 
-// GetGroupSort returns the normalized within-group sort mode: "actionable" only
-// when explicitly set, otherwise "creation" (the default).
+// GetGroupSort returns the normalized within-group sort mode: "actionable",
+// "recency", or "creation" (the default).
 func (c *UserConfig) GetGroupSort() string {
-	if c.GroupSort == "actionable" {
-		return "actionable"
+	if c.GroupSort == "actionable" || c.GroupSort == "recency" {
+		return c.GroupSort
 	}
 	return "creation"
 }

@@ -224,15 +224,28 @@ func SortInstancesByActionable(insts []*Instance) {
 		if zi != 1 {
 			return insts[i].Order < insts[j].Order
 		}
-		// Normal band. In actionable mode (issue #857) the status→recency tiers
-		// apply before Order; in creation mode (default) Order alone decides, so
-		// sessions keep their creation order (or K/J manual order).
+		// Normal band. Sort mode decides:
+		//   - "actionable" (issue #857): status→recency tiers before Order so the
+		//     most recently actionable sessions surface first.
+		//   - "recency": pure last-conversation-activity desc (tmux pane content
+		//     changed), so "what I was just talking to" sits at the top — Order is
+		//     only a stable tie-breaker.
+		//   - "creation" (default): Order alone, so sessions keep their creation
+		//     order (or K/J manual order).
 		if mode == "actionable" {
 			pi, pj := actionablePriority(insts[i].Status), actionablePriority(insts[j].Status)
 			if pi != pj {
 				return pi < pj
 			}
 			ai, aj := insts[i].LastAccessedAt, insts[j].LastAccessedAt
+			if !ai.Equal(aj) {
+				return ai.After(aj)
+			}
+		} else if mode == "recency" {
+			// GetLastActivityTime = tmux pane content last changed, the closest
+			// proxy to "recency of conversation" (captures both user input and
+			// agent output). Falls back to CreatedAt when untracked.
+			ai, aj := insts[i].GetLastActivityTime(), insts[j].GetLastActivityTime()
 			if !ai.Equal(aj) {
 				return ai.After(aj)
 			}
@@ -249,9 +262,9 @@ func SortInstancesByActionable(insts []*Instance) {
 var groupSortMode atomic.Value // holds string
 
 // SetGroupSortMode updates the cached within-group sort mode. Any value other
-// than "actionable" normalizes to "creation".
+// than "actionable" or "recency" normalizes to "creation".
 func SetGroupSortMode(mode string) {
-	if mode != "actionable" {
+	if mode != "actionable" && mode != "recency" {
 		mode = "creation"
 	}
 	groupSortMode.Store(mode)

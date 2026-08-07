@@ -2592,6 +2592,7 @@ func TestUserConfig_GetGroupSort(t *testing.T) {
 		{"", "creation"},
 		{"creation", "creation"},
 		{"actionable", "actionable"},
+		{"recency", "recency"},
 		{"garbage", "creation"},
 		{"ACTIONABLE", "creation"}, // case-sensitive; only exact "actionable" opts in
 	}
