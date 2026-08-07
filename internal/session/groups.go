@@ -242,10 +242,12 @@ func SortInstancesByActionable(insts []*Instance) {
 				return ai.After(aj)
 			}
 		} else if mode == "recency" {
-			// GetLastActivityTime = tmux pane content last changed, the closest
-			// proxy to "recency of conversation" (captures both user input and
-			// agent output). Falls back to CreatedAt when untracked.
-			ai, aj := insts[i].GetLastActivityTime(), insts[j].GetLastActivityTime()
+			// RecencyTime = best available "last real conversation activity"
+		// signal: live tmux window_activity (from the per-tick global cache),
+		// then hook status ts, then LastAccessedAt, then CreatedAt. Avoids
+		// GetLastActivityTime() whose stateTracker is seeded with time.Now()
+		// at creation and ties across all sessions on a fresh load.
+			ai, aj := insts[i].RecencyTime(), insts[j].RecencyTime()
 			if !ai.Equal(aj) {
 				return ai.After(aj)
 			}

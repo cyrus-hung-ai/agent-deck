@@ -888,6 +888,38 @@ func (inst *Instance) GetLastActivityTime() time.Time {
 	return inst.CreatedAt
 }
 
+// RecencyTime returns the best available "when did this session last see real
+// conversation activity" timestamp, for use as the group_sort="recency" key.
+// Precedence:
+//
+//  1. tmux window_activity from the live global cache (RefreshSessionCache
+//     fills it from `tmux list-windows -a -F #{window_activity}` on each
+//     TUI tick). This is real pane-output time — not the stateTracker's
+//     lastChangeTime, which is seeded with time.Now() at tracker creation
+//     and therefore ties across all sessions on a fresh load.
+//  2. LastHookActivityTime — durable, cross-process evidence from the hook
+//     status sidecar (fires on session start/stop).
+//  3. LastAccessedAt — when the user last attached in the TUI.
+//  4. CreatedAt — final fallback.
+//
+// Returns a zero time.Time only when none of the above is populated (e.g. a
+// brand-new session before any tick), in which case the recency sort's Order
+// tie-breaker keeps a stable position.
+func (inst *Instance) RecencyTime() time.Time {
+	if inst.tmuxSession != nil {
+		if ts := inst.tmuxSession.GetCachedWindowActivity(); ts > 0 {
+			return time.Unix(ts, 0)
+		}
+	}
+	if ts, ok := inst.LastHookActivityTime(); ok && !ts.IsZero() {
+		return ts
+	}
+	if !inst.LastAccessedAt.IsZero() {
+		return inst.LastAccessedAt
+	}
+	return inst.CreatedAt
+}
+
 // DisplayLastActivityTime returns the timestamp to show as "last active" in
 // the UI. It intentionally differs from GetLastActivityTime: that method
 // returns the tmux tracker's raw lastChangeTime (which is seeded with
