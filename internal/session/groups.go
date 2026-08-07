@@ -224,30 +224,15 @@ func SortInstancesByActionable(insts []*Instance) {
 		if zi != 1 {
 			return insts[i].Order < insts[j].Order
 		}
-		// Normal band. Sort mode decides:
-		//   - "actionable" (issue #857): status→recency tiers before Order so the
-		//     most recently actionable sessions surface first.
-		//   - "recency": pure last-conversation-activity desc (tmux pane content
-		//     changed), so "what I was just talking to" sits at the top — Order is
-		//     only a stable tie-breaker.
-		//   - "creation" (default): Order alone, so sessions keep their creation
-		//     order (or K/J manual order).
+		// Normal band. In actionable mode (issue #857) the status→recency tiers
+		// apply before Order; in creation mode (default) Order alone decides, so
+		// sessions keep their creation order (or K/J manual order).
 		if mode == "actionable" {
 			pi, pj := actionablePriority(insts[i].Status), actionablePriority(insts[j].Status)
 			if pi != pj {
 				return pi < pj
 			}
 			ai, aj := insts[i].LastAccessedAt, insts[j].LastAccessedAt
-			if !ai.Equal(aj) {
-				return ai.After(aj)
-			}
-		} else if mode == "recency" {
-			// RecencyTime = best available "last real conversation activity"
-		// signal: live tmux window_activity (from the per-tick global cache),
-		// then hook status ts, then LastAccessedAt, then CreatedAt. Avoids
-		// GetLastActivityTime() whose stateTracker is seeded with time.Now()
-		// at creation and ties across all sessions on a fresh load.
-			ai, aj := insts[i].RecencyTime(), insts[j].RecencyTime()
 			if !ai.Equal(aj) {
 				return ai.After(aj)
 			}
@@ -264,9 +249,9 @@ func SortInstancesByActionable(insts []*Instance) {
 var groupSortMode atomic.Value // holds string
 
 // SetGroupSortMode updates the cached within-group sort mode. Any value other
-// than "actionable" or "recency" normalizes to "creation".
+// than "actionable" normalizes to "creation".
 func SetGroupSortMode(mode string) {
-	if mode != "actionable" && mode != "recency" {
+	if mode != "actionable" {
 		mode = "creation"
 	}
 	groupSortMode.Store(mode)
@@ -643,32 +628,6 @@ func (t *GroupTree) Flatten() []Item {
 			// top/bottom of its group immediately — without this, the pin only
 			// takes effect after a restart. Operates on Flatten's local copies,
 			// never the tree's group.Sessions, and preserves unpinned order.
-			//
-			// Recency-mode live re-sort: tree-build only sorts once at load, so
-			// without this a session that just produced output wouldn't bubble up
-			// until a full tree rebuild. Re-sort the display copies here by
-			// RecencyTime desc (then Order as tie-breaker), then let the pin
-			// partition run on top. Other modes (creation/actionable) keep their
-			// load-time order via the stable partition below.
-			if mode := currentGroupSortMode(); mode == "recency" {
-				sort.SliceStable(parentSessions, func(i, j int) bool {
-					ai, aj := parentSessions[i].RecencyTime(), parentSessions[j].RecencyTime()
-					if !ai.Equal(aj) {
-						return ai.After(aj)
-					}
-					return parentSessions[i].Order < parentSessions[j].Order
-				})
-				for parentID := range subSessionsByParent {
-					sort.SliceStable(subSessionsByParent[parentID], func(i, j int) bool {
-						subs := subSessionsByParent[parentID]
-						ai, aj := subs[i].RecencyTime(), subs[j].RecencyTime()
-						if !ai.Equal(aj) {
-							return ai.After(aj)
-						}
-						return subs[i].Order < subs[j].Order
-					})
-				}
-			}
 			stablePinPartition(parentSessions)
 			for parentID := range subSessionsByParent {
 				stablePinPartition(subSessionsByParent[parentID])

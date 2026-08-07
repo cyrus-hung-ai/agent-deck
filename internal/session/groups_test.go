@@ -2401,10 +2401,6 @@ func TestGroupSortMode_DefaultAndSet(t *testing.T) {
 	if got := currentGroupSortMode(); got != "actionable" {
 		t.Fatalf("after set actionable = %q, want actionable", got)
 	}
-	SetGroupSortMode("recency")
-	if got := currentGroupSortMode(); got != "recency" {
-		t.Fatalf("after set recency = %q, want recency", got)
-	}
 	SetGroupSortMode("garbage")
 	if got := currentGroupSortMode(); got != "creation" {
 		t.Fatalf("garbage normalizes to %q, want creation", got)
@@ -2431,33 +2427,6 @@ func TestSortInstancesByActionable_CreationOrderDefault(t *testing.T) {
 	want := []string{"a", "b", "c"}
 	if !equalStrings(got, want) {
 		t.Fatalf("creation mode must order by Order asc; got %v want %v", got, want)
-	}
-}
-
-func TestSortInstancesByActionable_RecencyMode(t *testing.T) {
-	t.Cleanup(func() { SetGroupSortMode("creation") })
-	SetGroupSortMode("recency")
-	now := time.Now()
-
-	// In recency mode, sessions sort by last conversation activity desc (top =
-	// most recent), ignoring status. No tmux session is attached in unit tests,
-	// so GetLastActivityTime() falls back to CreatedAt — use that as the signal.
-	// Order values are intentionally inverted vs. recency to prove recency wins.
-	instances := []*Instance{
-		{ID: "oldest", GroupPath: "g", Order: 0, Status: StatusError, CreatedAt: now.Add(-3 * time.Hour)},
-		{ID: "newest", GroupPath: "g", Order: 1, Status: StatusStopped, CreatedAt: now},
-		{ID: "middle", GroupPath: "g", Order: 2, Status: StatusIdle, CreatedAt: now.Add(-1 * time.Hour)},
-	}
-	tree := NewGroupTree(instances)
-	got := []string{}
-	for _, s := range tree.Groups["g"].Sessions {
-		got = append(got, s.ID)
-	}
-	// Most-recent conversation first: newest, middle, oldest. Status (Error on
-	// oldest) must NOT float it up in pure-recency mode.
-	want := []string{"newest", "middle", "oldest"}
-	if !equalStrings(got, want) {
-		t.Fatalf("recency mode must order by last-activity desc; got %v want %v", got, want)
 	}
 }
 
