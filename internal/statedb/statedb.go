@@ -103,8 +103,9 @@ const SchemaVersion = 13
 // Thread-safe for concurrent use from multiple goroutines within one process.
 // Multiple OS processes can safely read/write via WAL mode + busy timeout.
 type StateDB struct {
-	db  *sql.DB
-	pid int
+	db       *sql.DB
+	pid      int
+	readOnly bool
 	// token identifies this StateDB's owning process instance for session
 	// claim ownership (see ClaimSessions). Raw PID alone is not a safe
 	// ownership key: after this process exits, the OS can recycle its PID for
@@ -352,8 +353,33 @@ func Open(dbPath string) (*StateDB, error) {
 	return &StateDB{db: db, pid: pid, path: dbPath, token: newOwnerToken(pid)}, nil
 }
 
+// OpenReadOnly opens an existing database without creating files, changing
+// pragmas, migrating schema, or checkpointing WAL state. It is intended for
+// product surfaces whose contract forbids every filesystem mutation.
+func OpenReadOnly(dbPath string) (*StateDB, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, err
+	}
+	// immutable=1 prevents SQLite from creating/updating WAL/SHM sidecars and
+	// is required by the byte-zero-effect contract of callers using this API.
+	dsn := "file:" + dbPath + "?mode=ro&immutable=1&_pragma=query_only(1)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("statedb: open read-only: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("statedb: open read-only: %w", err)
+	}
+	pid := os.Getpid()
+	return &StateDB{db: db, pid: pid, path: dbPath, token: newOwnerToken(pid), readOnly: true}, nil
+}
+
 // Close checkpoints WAL and closes the database.
 func (s *StateDB) Close() error {
+	if s.readOnly {
+		return s.db.Close()
+	}
 	// Checkpoint WAL to merge it back into the main database file
 	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return s.db.Close()
@@ -1437,6 +1463,88 @@ func (s *StateDB) WriteGeminiSessionBinding(id, sessionID string, detectedAt tim
 			         '$.gemini_detected_at', ?)
 			 WHERE id = ?`,
 			sessionID, detectedAt.Unix(), id,
+		)
+		return err
+	})
+}
+
+// WriteGenericSessionBinding persists a custom-tool conversation id
+// (tools configured via [tools.*] with resume_flag) into tool_data.
+// Mirrors WriteClaudeSessionBinding's json_set / withBusyRetry shape so a
+// live-env capture or `session set tool-session-id` survives reboot when
+// tmux is gone. Empty sessionID clears the keys.
+//
+// tool and location are the scope the id was captured under, written in the
+// SAME json_set as the id itself. They are not a separate write on purpose: an
+// id that reached disk while its scope did not would be resumed under the
+// wrong tool or on the wrong host, which is the failure the scope exists to
+// prevent (see internal/session/generic_session_scope.go).
+func (s *StateDB) WriteGenericSessionBinding(id, sessionID, tool, command, location string, detectedAt time.Time) error {
+	return withBusyRetry(func() error {
+		if sessionID == "" {
+			_, err := s.db.Exec(
+				`UPDATE instances
+				   SET tool_data = json_remove(
+				         COALESCE(tool_data, '{}'),
+				         '$.generic_session_id',
+				         '$.generic_detected_at',
+				         '$.generic_session_tool',
+				         '$.generic_session_command',
+				         '$.generic_session_location')
+				 WHERE id = ?`,
+				id,
+			)
+			return err
+		}
+		at := detectedAt.Unix()
+		if detectedAt.IsZero() {
+			at = time.Now().Unix()
+		}
+		_, err := s.db.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         '$.generic_session_id', ?,
+			         '$.generic_detected_at', ?,
+			         '$.generic_session_tool', ?,
+			         '$.generic_session_command', ?,
+			         '$.generic_session_location', ?)
+			 WHERE id = ?`,
+			sessionID, at, tool, command, location, id,
+		)
+		return err
+	})
+}
+
+// WriteLastActivityAt atomically rewrites tool_data.last_activity_at
+// (issue #1846's durable activity record) without touching any unrelated
+// keys — same json_set/withBusyRetry shape as WriteClaudeSessionBinding,
+// and for the same reason: the observing process (TUI hook watcher,
+// attach-return) has no save cycle it can rely on to flush the in-memory
+// value before the evidence behind it is gone.
+func (s *StateDB) WriteLastActivityAt(id string, at time.Time) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         '$.last_activity_at', ?)
+			 WHERE id = ?`,
+			at.Unix(), id,
+		)
+		return err
+	})
+}
+
+// WriteLastAccessed atomically updates the last_accessed column for one
+// instance. MarkAccessed (#1846) uses this so each attach/detach is durable
+// on its own instead of waiting for a full saveInstances that may never run
+// before the TUI exits.
+func (s *StateDB) WriteLastAccessed(id string, at time.Time) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances SET last_accessed = ? WHERE id = ?`,
+			at.Unix(), id,
 		)
 		return err
 	})

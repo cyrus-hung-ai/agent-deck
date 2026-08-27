@@ -76,12 +76,13 @@ var modelContextWindowPrefixes = []struct {
 	prefix string
 	size   int
 }{
-	// 5.x models: 1M context (must precede 4.x fallback)
-	{"claude-opus-5", 1000000},
-	{"claude-sonnet-5", 1000000},
-	{"claude-fable-5", 1000000},
+	// Claude 5 family: 1M context
+	{"claude-fable-5", 1_000_000},
+	{"claude-mythos-5", 1_000_000},
+	{"claude-opus-5", 1_000_000},
+	{"claude-sonnet-5", 1_000_000},
 	// 4.8 models: 1M context (must precede 4.x fallback)
-	{"claude-opus-4-8", 1000000},
+	{"claude-opus-4-8", 1_000_000},
 	// 4.7 models: 1M context (must precede 4.x fallback)
 	{"claude-opus-4-7", 1000000},
 	// 4.6 models: 1M context

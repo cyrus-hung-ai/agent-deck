@@ -234,10 +234,15 @@ func handleWorktreeList(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Build session map: path -> session title
+	// Build session map: LOCAL path -> session. A remote session contributes
+	// nothing: its ProjectPath is a placeholder, not a checkout, so listing it
+	// here labels a local worktree with a session running on another host
+	// (#1852 site 2).
 	sessionByPath := make(map[string]*session.Instance)
 	for _, inst := range instances {
-		sessionByPath[inst.ProjectPath] = inst
+		if loc := locationOf(inst); loc.IsLocal() && loc.Path != "" {
+			sessionByPath[loc.Path] = inst
+		}
 		if inst.WorktreePath != "" {
 			sessionByPath[inst.WorktreePath] = inst
 		}
@@ -445,30 +450,20 @@ func handleWorktreeCleanup(profile string, args []string) {
 
 	// Find orphaned worktrees (exist but no session points to them)
 	var orphanedWorktrees []vcs.Worktree
+	var protectedWorktrees []worktreeCleanupFacts
 	var cleanupBackend vcs.Backend
 
 	if backend, bErr := detectAndCreateBackend(cwd); bErr == nil {
 		cleanupBackend = backend
 		worktrees, wErr := cleanupBackend.ListWorktrees()
 		if wErr == nil {
-			// Build set of paths that sessions use
-			sessionPaths := make(map[string]bool)
-			for _, inst := range instances {
-				sessionPaths[inst.ProjectPath] = true
-				if inst.WorktreePath != "" {
-					sessionPaths[inst.WorktreePath] = true
-				}
-			}
+			// Build the set of LOCAL paths that sessions occupy. This is the
+			// harmful direction of #1852 site 3: a remote session's placeholder
+			// inserted here makes a genuinely orphaned worktree look in-use, so
+			// cleanup silently skips it forever.
+			sessionPaths := localSessionPaths(instances)
 
-			// Check each worktree (skip the first one which is usually the main repo)
-			for i, wt := range worktrees {
-				if i == 0 {
-					continue // Skip main repo
-				}
-				if !sessionPaths[wt.Path] {
-					orphanedWorktrees = append(orphanedWorktrees, wt)
-				}
-			}
+			orphanedWorktrees, protectedWorktrees = classifyUnregisteredWorktrees(worktrees, sessionPaths)
 		}
 	}
 
@@ -490,11 +485,16 @@ func handleWorktreeCleanup(profile string, args []string) {
 				"branch": wt.Branch,
 			})
 		}
+		protectedWorktreeData := make([]map[string]interface{}, 0, len(protectedWorktrees))
+		for _, facts := range protectedWorktrees {
+			protectedWorktreeData = append(protectedWorktreeData, facts.jsonData())
+		}
 
 		result := map[string]interface{}{
-			"orphaned_sessions":  orphanedSessionData,
-			"orphaned_worktrees": orphanedWorktreeData,
-			"dry_run":            !*force,
+			"orphaned_sessions":   orphanedSessionData,
+			"orphaned_worktrees":  orphanedWorktreeData,
+			"protected_worktrees": protectedWorktreeData,
+			"dry_run":             !*force,
 		}
 
 		out.Print("", result)
@@ -506,7 +506,7 @@ func handleWorktreeCleanup(profile string, args []string) {
 
 	// Human-readable output
 	if !*jsonOutput {
-		if len(orphanedSessions) == 0 && len(orphanedWorktrees) == 0 {
+		if len(orphanedSessions) == 0 && len(orphanedWorktrees) == 0 && len(protectedWorktrees) == 0 {
 			fmt.Println("No orphans found. Everything is clean!")
 			return
 		}
@@ -523,6 +523,14 @@ func handleWorktreeCleanup(profile string, args []string) {
 			fmt.Println("Orphaned Worktrees (no session associated):")
 			for _, wt := range orphanedWorktrees {
 				fmt.Printf("  - %s (branch: %s)\n", FormatPath(wt.Path), wt.Branch)
+			}
+			fmt.Println()
+		}
+
+		if len(protectedWorktrees) > 0 {
+			fmt.Println("Protected Worktrees (not orphans; cleanup will not remove):")
+			for _, facts := range protectedWorktrees {
+				fmt.Printf("  - %s (branch: %s; %s)\n", FormatPath(facts.Worktree.Path), facts.Worktree.Branch, facts.summary())
 			}
 			fmt.Println()
 		}
@@ -587,8 +595,22 @@ func handleWorktreeCleanup(profile string, args []string) {
 			fmt.Fprintf(os.Stderr, "Warning: no VCS backend for worktree removal\n")
 			break
 		}
-		if err := cleanupBackend.RemoveWorktree(wt.Path, false); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to remove worktree %s: %v\n", wt.Path, err)
+		// Confirmation may wait indefinitely. Reload both registry ownership and
+		// repository state, then inspect the candidate again at the destructive
+		// boundary. --force authorizes removal; it never bypasses this gate.
+		removed, skipReason, removeErr := removeCleanupCandidate(cleanupBackend, wt, func() (map[string]bool, error) {
+			_, currentInstances, _, err := loadSessionData(profile)
+			if err != nil {
+				return nil, err
+			}
+			return localSessionPaths(currentInstances), nil
+		})
+		if !removed {
+			if removeErr != nil {
+				fmt.Printf("Skipped worktree: %s (%s: %v)\n", FormatPath(wt.Path), skipReason, removeErr)
+			} else {
+				fmt.Printf("Skipped worktree: %s (%s)\n", FormatPath(wt.Path), skipReason)
+			}
 			continue
 		}
 		removedWorktrees++

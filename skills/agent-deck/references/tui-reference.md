@@ -36,6 +36,8 @@ Complete reference for agent-deck Terminal UI features.
 | `f` | Quick fork (Claude/OpenCode/Pi/Codex) |
 | `F` | Fork with options (Claude/OpenCode/Pi/Codex) |
 
+For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses or moves to the parent. Remote-session reorder keys move only within the current remote group; the order is saved on the viewing machine, while remote group headers remain name-sorted.
+
 ### Group Actions
 
 | Key | Action |
@@ -54,7 +56,7 @@ Complete reference for agent-deck Terminal UI features.
 | `!` | Filter: running only (toggle) |
 | `@` | Filter: waiting only (toggle) |
 | `#` | Filter: idle only (toggle) |
-| `$` | Filter: error only (toggle) |
+| `&` | Filter: error only (toggle) |
 | `^` | Filter: view archived sessions (toggle) |
 
 ### Global
@@ -65,9 +67,10 @@ Complete reference for agent-deck Terminal UI features.
 | `i` | Import existing tmux sessions |
 | `Ctrl+R` | Manual refresh |
 | `Ctrl+Q` | Detach (keep tmux running) |
+| `$` | Cost Dashboard |
 | `q` / `Ctrl+C` | Quit |
 
-## Status Indicators
+## Local Status Indicators
 
 | Symbol | Status | Color | Meaning |
 |--------|--------|-------|---------|
@@ -76,6 +79,8 @@ Complete reference for agent-deck Terminal UI features.
 | `○` | Idle | Gray | Stopped, acknowledged |
 | `✕` | Error | Red | tmux session doesn't exist |
 | `⟳` | Starting | Yellow | Session launching |
+
+Federated remote rows currently carry coarse running/waiting/idle/error status; local Honest Status substates are not included in the remote payload.
 
 ## Dialogs
 

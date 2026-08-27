@@ -30,6 +30,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
+	"github.com/asheshgoplani/agent-deck/internal/agents"
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/docker"
@@ -152,6 +153,16 @@ const (
 // (shows all sessions except error/stopped). Change this constant to rebind.
 const FilterKeyActive = "%"
 
+// FilterKeyError is the keyboard shortcut for the error-only status filter.
+// Keep it distinct from CostDashboardKey: advertised keys must have exactly
+// one meaning in the overview context, regardless of whether cost tracking is
+// available.
+const FilterKeyError = "&"
+
+// CostDashboardKey opens the cost dashboard. It is deliberately not reused as
+// a conditional fallback for another action.
+const CostDashboardKey = "$"
+
 // FilterKeyArchived toggles the archived-sessions list view.
 const FilterKeyArchived = "^"
 
@@ -270,8 +281,19 @@ type Home struct {
 	feedbackState        *feedback.State       // Loaded at first show, avoids repeated disk I/O
 	feedbackSender       *feedback.Sender      // Sender constructed once in NewHome (Phase 3, per D-05)
 	watcherPanel         *WatcherPanel         // For showing watcher status and events
-	toolVisibilityPanel  *ToolVisibilityPanel  // Edits [ui].hidden_tools
-	watcherEngine        *watcher.Engine       // nil until Init (D-07: lifecycle tied to TUI startup)
+	agentsPanel          *AgentsPanel          // Agents tab: adopted agents, grouped by machine
+	// agentsView is the last built fleet view; agentBySession indexes its
+	// rows by adopted session id so the session list can mark agent-owned
+	// rows and the preview pane can render their card. Both are empty for a
+	// user who has adopted nothing, which is what keeps those surfaces
+	// invisible by default.
+	agentsView          agents.View
+	agentBySession      map[string]agents.AgentRow
+	agentsLastRefresh   time.Time
+	agentsLoaded        bool
+	agentsLoadError     string
+	toolVisibilityPanel *ToolVisibilityPanel // Edits [ui].hidden_tools
+	watcherEngine       *watcher.Engine      // nil until Init (D-07: lifecycle tied to TUI startup)
 
 	// Configurable hotkeys
 	hotkeys        map[string]string // action -> configured key
@@ -371,6 +393,19 @@ type Home struct {
 	// Window toggle state — sessions with collapsed window sub-items
 	windowsCollapsed map[string]bool // sessionID -> true if windows hidden
 
+	// Remote tree fold state — headers the user collapsed, keyed by Item.Path
+	// ("remotes/<name>" or "remotes/<name>/<group>"). Remote groups are
+	// synthetic UI buckets, not rows in groupTree, so they need their own
+	// store rather than groupTree's expanded flags.
+	remoteGroupsCollapsed map[string]bool
+
+	// Manual order of remote session rows (#1875): remote -> group path ->
+	// session IDs. Remote rows are not Instances in groupTree, so shift+up/down
+	// cannot move them there; this local overlay carries the order instead and
+	// is persisted in ui_state (see applyRemoteSessionOrder for the drift
+	// rules and remoteOrder for why the scoping is nested).
+	remoteSessionOrder remoteOrder
+
 	// Worktree dirty status cache (lazy, 10s TTL)
 	worktreeDirtyCache   map[string]bool      // sessionID -> isDirty
 	worktreeDirtyCacheTs map[string]time.Time // sessionID -> cache timestamp
@@ -380,8 +415,9 @@ type Home struct {
 	lastCachePrune time.Time
 
 	// Hook-based status detection (Claude Code lifecycle hooks)
-	hookWatcher        *session.StatusFileWatcher
-	pendingHooksPrompt bool // True if user should be prompted to install hooks
+	hookWatcher              *session.StatusFileWatcher
+	pendingHooksPrompt       bool // True if user should be prompted to install Claude hooks
+	pendingHermesHooksPrompt bool // True if user should be prompted to install Hermes hooks
 
 	// SSE-based status detection for OpenCode sessions (issue #1614)
 	sseWatcher *session.OpenCodeSSEWatcher
@@ -420,6 +456,7 @@ type Home struct {
 	// Launching animation state (for newly created sessions)
 	launchingSessions    map[string]time.Time        // sessionID -> creation time
 	resumingSessions     map[string]time.Time        // sessionID -> resume time (for restart/resume)
+	remoteRestarting     map[string]struct{}         // remote restart operation ID -> in flight
 	mcpLoadingSessions   map[string]time.Time        // sessionID -> MCP reload time
 	forkingSessions      map[string]time.Time        // sessionID -> fork start time (fork in progress)
 	setupRunningSessions map[string]time.Time        // sessionID -> setup script start time
@@ -581,6 +618,8 @@ type Home struct {
 
 	// Remote sessions (Phase 2: Agent-Deck Remotes)
 	remoteSessions     map[string][]session.RemoteSessionInfo // remoteName -> sessions
+	remoteFromCache    map[string]bool                        // remoteName -> data is a startup cache snapshot, not live yet
+	remoteFetchedAt    map[string]time.Time                   // remoteName -> when its sessions last came from a live fetch
 	remoteSessionsMu   sync.RWMutex
 	lastRemoteFetch    time.Time // When remote sessions were last fetched
 	remotesFetchActive bool      // Prevents overlapping fetches
@@ -722,6 +761,17 @@ type uiState struct {
 	PreviewMode     int    `json:"preview_mode"`
 	StatusFilter    string `json:"status_filter,omitempty"`
 	GroupViewMode   int    `json:"group_view_mode,omitempty"`
+	// Collapsed remote headers, keyed like Item.Path. Local group folds live in
+	// groupTree, which is persisted separately by saveGroupState; remote groups
+	// are synthetic UI rows and have no home there.
+	RemoteGroupsCollapsed []string `json:"remote_groups_collapsed,omitempty"`
+
+	// RemoteSessionOrder is the manual order of remote session rows (#1875):
+	// remote -> group path -> session IDs. It rides in ui_state because it is
+	// a view preference of this machine, exactly like the preview mode and
+	// status filter above. Nested rather than flat-keyed so a remote name or
+	// group path containing "/" cannot alias another bucket (see remoteOrder).
+	RemoteSessionOrder map[string]map[string][]string `json:"remote_session_order,omitempty"`
 }
 
 type selectedItemIdentity struct {
@@ -1004,6 +1054,17 @@ func (h *Home) collapseOrNavUp() {
 			}
 		}
 		collapsed = true
+	} else if item.Type == session.ItemTypeRemoteGroup {
+		// Fold shut if open; if already shut, walk to the parent header so the
+		// key keeps behaving like "collapse or go up" on the remote side too.
+		if !h.setRemoteGroupCollapsed(item.RemoteName, item.Path, true) {
+			if parent := remoteGroupParentPath(item.Path); parent != "" {
+				h.moveCursorToRemoteGroup(item.RemoteName, parent)
+			}
+		}
+	} else if item.Type == session.ItemTypeRemoteSession {
+		// Item.Path is the owning group header's path.
+		h.setRemoteGroupCollapsed(item.RemoteName, item.Path, true)
 	}
 	if collapsed {
 		h.saveGroupState()
@@ -1083,6 +1144,56 @@ func (h *Home) getLayoutMode() string {
 	default:
 		return LayoutModeDual
 	}
+}
+
+// contentChromeTop returns the number of rows rendered ABOVE the main content
+// area (the header line + filter bar + optional update/maintenance banners).
+// The debug footer is NOT included — it renders below the content, so it
+// doesn't shift the content's top edge. Kept in one place so mouse Y-routing
+// and the render path agree on where content starts.
+func (h *Home) contentChromeTop() int {
+	top := 1 // header line
+	top++    // filter bar (always shown, matches View())
+	if h.shouldRenderUpdateNudge() {
+		top++
+	}
+	if h.maintenanceMsg != "" {
+		top++
+	}
+	return top
+}
+
+// stackedPreviewTopY returns the screen Y (0-indexed) of the first row of the
+// PREVIEW region in the stacked layout, i.e. the row just below the horizontal
+// separator. A mouse-wheel event at or below this Y is over the preview and
+// should scroll it rather than move the list cursor. Returns -1 when the
+// current layout is not stacked. Mirrors renderStackedLayout's height split:
+//
+//	[content-top] SESSIONS title (panelTitleLines) + list (listHeight-title)
+//	              + separator (1)  <- divider
+//	[preview-top] PREVIEW title + preview content
+func (h *Home) stackedPreviewTopY() int {
+	if h.getLayoutMode() != LayoutModeStacked {
+		return -1
+	}
+	const helpBarHeight = 2
+	filterBarHeight := 1
+	updateBannerHeight := 0
+	if h.shouldRenderUpdateNudge() {
+		updateBannerHeight = 1
+	}
+	maintenanceBannerHeight := 0
+	if h.maintenanceMsg != "" {
+		maintenanceBannerHeight = 1
+	}
+	debugBarHeight := 0
+	if h.debugMode {
+		debugBarHeight = 1
+	}
+	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
+	listHeight := h.stackedListHeight(contentHeight)
+	// content top + full list block (title + body) + the 1-row separator.
+	return h.contentChromeTop() + listHeight + 1
 }
 
 // Messages
@@ -1330,6 +1441,10 @@ func shouldAutoInstallCursorHooks(userConfig *session.UserConfig, cursorCmd stri
 	return homeBackgroundWorkersEnabled && cursorHooksEnabled && cursorCmd != ""
 }
 
+func shouldPromptHermesHooks(installed bool, decision string) bool {
+	return !installed && decision == ""
+}
+
 // NewHomeWithProfileAndMode creates a new Home with the specified profile.
 // All instances manage the notification bar equally via shared SQLite state.
 func NewHomeWithProfileAndMode(profile string) *Home {
@@ -1394,6 +1509,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		zoxidePicker:              NewZoxidePicker(),
 		feedbackSender:            feedback.NewSender(),
 		watcherPanel:              NewWatcherPanel(),
+		agentsPanel:               NewAgentsPanel(),
 		toolVisibilityPanel:       NewToolVisibilityPanel(),
 		insertBatchDuration:       defaultInsertBatchDuration,
 		insertOpenKeySender:       defaultInsertOpenKeySender,
@@ -1413,12 +1529,15 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		clearOnCompactSent:        make(map[string]time.Time),
 		launchingSessions:         make(map[string]time.Time),
 		resumingSessions:          make(map[string]time.Time),
+		remoteRestarting:          make(map[string]struct{}),
 		mcpLoadingSessions:        make(map[string]time.Time),
 		forkingSessions:           make(map[string]time.Time),
 		setupRunningSessions:      make(map[string]time.Time),
 		creatingSessions:          make(map[string]*CreatingSession),
 		lastLogActivity:           make(map[string]time.Time),
 		windowsCollapsed:          make(map[string]bool),
+		remoteGroupsCollapsed:     make(map[string]bool),
+		remoteSessionOrder:        make(remoteOrder),
 		worktreeDirtyCache:        make(map[string]bool),
 		worktreeDirtyCacheTs:      make(map[string]time.Time),
 		statusTrigger:             make(chan statusUpdateRequest, 1), // Buffered to avoid blocking
@@ -1483,7 +1602,11 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	// Interval-hook runner. Constructed unconditionally (cheap); Start() is a
 	// no-op when no [interval_hooks] are configured, and hooks are re-read from
 	// config each tick so they can be added/removed without a restart.
+	// Registered globally so the signal-exit path in cmd/agent-deck/main.go
+	// can stop in-flight hook runs before os.Exit (#1829); the in-app quit
+	// path stops it via performFinalShutdown.
 	h.intervalHookRunner = intervalhook.New(uiLog)
+	intervalhook.SetGlobal(h.intervalHookRunner)
 
 	// Keep settings panel profile-aware so profile overrides (e.g., Claude config dir)
 	// are displayed and edited in the correct scope.
@@ -1491,6 +1614,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 
 	// Restore persisted UI state (preview mode, status filter, cursor position)
 	h.loadUIState()
+	h.loadRemoteSessionsCache()
 
 	// Apply default_filter from config if no filter was restored from persisted state.
 	// Auto-clears if no sessions match (handled in rebuildFlatItems).
@@ -1646,10 +1770,11 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		}
 	}
 
-	// Hermes shell hooks: auto-inject silently if the hermes binary is available.
-	// No user prompt needed — config.yaml is Hermes's own config file, not a
-	// shared settings file. The shared hook watcher (h.hookWatcher) covers all
-	// tools, so start it here if Claude hooks didn't already start it.
+	// Hermes shell hooks require their own consent because they mutate Hermes's
+	// config.yaml. An installed hook set predates (or embodies) consent and does
+	// not prompt. Any recorded decision suppresses future prompts; in particular,
+	// accepted hooks that are later removed stay removed because removal revokes
+	// consent rather than triggering a silent reinstall.
 	if hermesCmd := strings.TrimSpace(session.GetToolCommand("hermes")); homeBackgroundWorkersEnabled && hermesCmd != "" {
 		// GetToolCommand may return a full command string with arguments
 		// (e.g. "hermes --gateway-url=..."). LookPath needs the binary name only.
@@ -1659,14 +1784,15 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 			hermesBin := hermesFields[0]
 			if _, err := exec.LookPath(hermesBin); err == nil {
 				hermesConfigDir := session.GetHermesConfigDir()
-				if !session.CheckHermesHooksInstalled(hermesConfigDir) {
-					if _, err := session.InjectHermesHooks(hermesConfigDir); err != nil {
-						uiLog.Warn("hermes_hooks_inject_failed", slog.String("error", err.Error()))
-					} else {
-						uiLog.Info("hermes_hooks_installed", slog.String("config_dir", hermesConfigDir))
-					}
+				installed := session.CheckHermesHooksInstalled(hermesConfigDir)
+				decision := ""
+				if db := statedb.GetGlobal(); db != nil {
+					decision, _ = db.GetMeta("hermes_hooks_prompted")
 				}
-				if h.hookWatcher == nil {
+				if shouldPromptHermesHooks(installed, decision) {
+					h.pendingHermesHooksPrompt = true
+				}
+				if installed && h.hookWatcher == nil {
 					if hookWatcher, err := session.NewStatusFileWatcher(nil); err == nil {
 						h.hookWatcher = hookWatcher
 						go hookWatcher.Start()
@@ -1676,11 +1802,11 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		}
 	}
 
-	// Cursor Agent CLI hooks: auto-inject silently when the cursor binary is
-	// available, unless the user opted out via [cursor] hooks_enabled = false
-	// (set durably by `agent-deck cursor-hooks uninstall`, issue #1672).
-	// The opt-out gates the watcher too, matching the [claude] hooks_enabled
-	// gate above.
+	// Cursor Agent CLI hooks: auto-inject silently when the resolved Cursor CLI
+	// binary (`agent` or `cursor`) is available, unless the user opted out via
+	// [cursor] hooks_enabled = false (set durably by `agent-deck cursor-hooks
+	// uninstall`, issue #1672). The opt-out gates the watcher too, matching the
+	// [claude] hooks_enabled gate above.
 	cursorCmd := strings.TrimSpace(session.GetToolCommand("cursor"))
 	if shouldAutoInstallCursorHooks(userConfig, cursorCmd) {
 		if cursorFields := strings.Fields(cursorCmd); len(cursorFields) > 0 {
@@ -1990,9 +2116,20 @@ func (h *Home) publishWebMenuSnapshot() {
 		return
 	}
 
+	// Archived sessions live in h.instances — the TUI drops them at render time
+	// in rebuildFlatItems, not at load time. The web snapshot is built from
+	// h.instances instead of h.flatItems, so it must apply the archive filter
+	// itself or archived sessions surface as ordinary sidebar rows. This mirrors
+	// SessionDataService.LoadMenuSnapshot, the storage-backed loader that serves
+	// headless mode. The archived view is fed separately by
+	// LoadArchivedMenuSnapshot, so nothing here needs to preserve them.
+	//
+	// FilterInstancesByArchive allocates the copy this function needs anyway, so
+	// it replaces the previous make+copy rather than adding to it — same one
+	// allocation per publish, and the archive read happens under the same lock
+	// that guards the slice.
 	h.instancesMu.RLock()
-	instancesCopy := make([]*session.Instance, len(h.instances))
-	copy(instancesCopy, h.instances)
+	instancesCopy := session.FilterInstancesByArchive(h.instances, false)
 	h.instancesMu.RUnlock()
 
 	groupTreeCopy := h.groupTree.ShallowCopyForSave()
@@ -2209,6 +2346,65 @@ func (h *Home) moveCursorToGroup(path string) {
 			return
 		}
 	}
+}
+
+// moveCursorToRemoteGroup parks the cursor on a remote header after a rebuild.
+// Remote headers are identified by RemoteName+Path, the same pair that
+// cursor-identity restore matches on.
+func (h *Home) moveCursorToRemoteGroup(remoteName, path string) {
+	for i, fi := range h.flatItems {
+		if fi.Type == session.ItemTypeRemoteGroup && fi.RemoteName == remoteName && fi.Path == path {
+			h.cursor = i
+			return
+		}
+	}
+}
+
+// isRemoteGroupCollapsed reports whether a remote header is folded shut.
+func (h *Home) isRemoteGroupCollapsed(path string) bool {
+	return h.remoteGroupsCollapsed[path]
+}
+
+// setRemoteGroupCollapsed folds a remote header open or shut, rebuilds the tree
+// and keeps the cursor on the header the user acted on. Returns false when the
+// state was already what was asked for, so callers can fall through to
+// navigation instead of repainting for nothing.
+func (h *Home) setRemoteGroupCollapsed(remoteName, path string, collapsed bool) bool {
+	if h.remoteGroupsCollapsed == nil {
+		h.remoteGroupsCollapsed = make(map[string]bool)
+	}
+	if h.remoteGroupsCollapsed[path] == collapsed {
+		return false
+	}
+	if collapsed {
+		h.remoteGroupsCollapsed[path] = true
+	} else {
+		delete(h.remoteGroupsCollapsed, path)
+	}
+	h.rebuildFlatItems()
+	h.moveCursorToRemoteGroup(remoteName, path)
+	h.saveUIState()
+	return true
+}
+
+// toggleRemoteGroup flips a remote header's fold state.
+func (h *Home) toggleRemoteGroup(remoteName, path string) {
+	h.setRemoteGroupCollapsed(remoteName, path, !h.remoteGroupsCollapsed[path])
+}
+
+// remoteGroupParentPath returns the header one level up from a remote path, or
+// "" for the Level-0 remote root. "remotes/<name>/a/b" -> "remotes/<name>/a",
+// "remotes/<name>/a" -> "remotes/<name>".
+func remoteGroupParentPath(path string) string {
+	idx := strings.LastIndex(path, "/")
+	if idx < 0 {
+		return ""
+	}
+	parent := path[:idx]
+	if parent == "remotes" {
+		return ""
+	}
+	return parent
 }
 
 func (h *Home) captureSelectedItemIdentity() selectedItemIdentity {
@@ -2474,7 +2670,8 @@ func (h *Home) rebuildFlatItems() {
 		for _, remoteName := range remoteNames {
 			// #1553: nest each remote's sessions under their Group paths
 			// instead of dumping them flat at Level 1.
-			h.flatItems = append(h.flatItems, buildRemoteFlatItems(remoteName, remotes[remoteName])...)
+			// #1875: apply the user's manual row order for this remote.
+			h.flatItems = append(h.flatItems, buildRemoteFlatItemsOrdered(remoteName, remotes[remoteName], h.remoteGroupsCollapsed, h.remoteSessionOrder.forRemote(remoteName))...)
 		}
 	}
 
@@ -3176,7 +3373,9 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 		wg.Add(1)
 		go func(name string, rc session.RemoteConfig) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
+			// Honor the per-remote command_timeout_seconds: hosts with large
+			// session fleets legitimately need more than the old flat 15s.
+			ctx, cancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
 			defer cancel()
 
 			runner := session.NewSSHRunner(name, rc)
@@ -3190,7 +3389,12 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 			for i := range sessions {
 				sessions[i].RemoteName = name
 			}
-			summary, costErr := runner.FetchCostSummary(ctx)
+			// #1912 follow-up: the session-list fetch may have consumed most
+			// of the shared budget on a slow remote, which silently dropped
+			// that remote's spend from the totals. Give costs their own bound.
+			costCtx, costCancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
+			summary, costErr := runner.FetchCostSummary(costCtx)
+			costCancel()
 
 			mu.Lock()
 			results[name] = sessions
@@ -3685,7 +3889,7 @@ func (h *Home) fetchRemotePreview(remoteName, sessionID, key string) tea.Cmd {
 		}
 
 		runner := session.NewSSHRunner(remoteName, rc)
-		ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
+		ctx, cancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
 		defer cancel()
 
 		// #1101: use FetchSessionPane (raw capture-pane content with ANSI +
@@ -5184,6 +5388,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.setupWizard.SetSize(msg.Width, msg.Height)
 		h.settingsPanel.SetSize(msg.Width, msg.Height)
 		h.watcherPanel.SetSize(msg.Width, msg.Height)
+		h.agentsPanel.SetSize(msg.Width, msg.Height)
 		if h.toolVisibilityPanel != nil {
 			h.toolVisibilityPanel.SetSize(msg.Width, msg.Height)
 		}
@@ -5245,15 +5450,24 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return h, nil
 			}
 			// Preview pane scroll (#574): when the wheel event lands in the
-			// preview region of the dual layout, scroll preview content
-			// instead of moving the list cursor. Other layouts keep the
-			// legacy list-scroll behaviour because they have no dedicated
-			// preview click-target (single = no preview; stacked = same-
-			// width column where Y-based routing is ambiguous enough to
-			// leave as list-scroll).
-			if h.getLayoutMode() == LayoutModeDual {
+			// preview region, scroll preview content instead of moving the
+			// list cursor. Dual layout routes by X (preview is the right
+			// column); stacked layout routes by Y (preview is the lower
+			// region, below the horizontal divider). Single layout has no
+			// preview target, so it keeps the legacy list-scroll behaviour.
+			switch h.getLayoutMode() {
+			case LayoutModeDual:
 				leftWidth := h.sessionsPaneWidth()
 				if msg.X >= leftWidth {
+					if msg.Button == tea.MouseButtonWheelUp {
+						h.previewScrollOffset++
+					} else if h.previewScrollOffset > 0 {
+						h.previewScrollOffset--
+					}
+					return h, nil
+				}
+			case LayoutModeStacked:
+				if top := h.stackedPreviewTopY(); top >= 0 && msg.Y >= top {
 					if msg.Button == tea.MouseButtonWheelUp {
 						h.previewScrollOffset++
 					} else if h.previewScrollOffset > 0 {
@@ -5338,9 +5552,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.reloadHotkeysFromConfig()
 
 		// Show hooks installation prompt (after splash screen is gone)
-		if h.pendingHooksPrompt && !h.setupWizard.IsVisible() {
-			h.confirmDialog.ShowInstallHooks()
-			h.confirmDialog.SetSize(h.width, h.height)
+		if !h.setupWizard.IsVisible() {
+			h.showPendingHooksPrompt()
 		}
 
 		// Show feedback popup if user has a new version and hasn't rated yet (D-11/D-12).
@@ -6000,7 +6213,23 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.cachedStatusCounts.valid.Store(false)
 				h.rebuildFlatItems()
 			}
-			// Save the updated session state (new tmux session name)
+			// The name and status this restart produced are already durable:
+			// Instance.restart records them with a targeted two-column write at
+			// the moment it mints them (#1870). This save is for the rest of the
+			// restart's in-memory state, and it stays a ROUTINE save on purpose.
+			//
+			// The first shape of this fix force-saved here, to stop the
+			// external-change abort from discarding the new tmux name. That cured
+			// a lost restart mutation with a much worse failure: a force save
+			// pushes this TUI's whole in-memory snapshot, so an archive, rename or
+			// group move another process made while this TUI was stale is silently
+			// reverted -- the lost-update shape behind this repository's data-loss
+			// incidents. A single wrong field is never worth a whole-snapshot write.
+			//
+			// adoptRestartRecord below keeps the abort from firing on this TUI's
+			// OWN restart write, which is what made the abort look like the
+			// problem in the first place.
+			h.adoptRestartRecord(msg.sessionID)
 			h.saveInstances()
 			if msg.warning != "" {
 				h.setError(fmt.Errorf("%s", msg.warning))
@@ -6045,9 +6274,15 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// #1170: merge rather than wholesale-replace so a remote that errored
 		// this round keeps its last-good sessions instead of flickering out.
 		h.remoteSessions = mergeRemoteSessions(h.remoteSessions, msg.sessions, msg.failed)
+		for name := range msg.sessions {
+			if !msg.failed[name] {
+				delete(h.remoteFromCache, name)
+			}
+		}
 		h.lastRemoteFetch = time.Now()
 		h.remotesFetchActive = false
 		h.remoteSessionsMu.Unlock()
+		h.saveRemoteSessionsCache(msg.sessions)
 		// #1101: store remote cost summaries so renderCostLine can fold them
 		// into the displayed totals on the next paint.
 		h.remoteCostsMu.Lock()
@@ -6092,6 +6327,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, h.fetchRemoteSessions
 
 	case remoteSessionRestartedMsg:
+		delete(h.remoteRestarting, remoteRestartAnimationID(msg.remoteName, msg.sessionID))
+		delete(h.resumingSessions, remoteRestartAnimationID(msg.remoteName, msg.sessionID))
 		if msg.err != nil {
 			h.setError(fmt.Errorf("failed to restart remote session: %w", msg.err))
 			return h, nil
@@ -6215,6 +6452,15 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ts := inst.GetTmuxSession()
 		if ts == nil || ts.Name == "" {
 			h.setError(fmt.Errorf("session %q is not running; start it before prompting", inst.Title))
+			return h, nil
+		}
+		// PR #1942 review (P1a): the same refusal the CLI send path applies.
+		// A pane that runs a server rather than an agent has no prompt to type
+		// into, and the delivery below would report success while the text went
+		// to the server's stdin. Surfaced through setError so the user sees it
+		// instead of watching a prompt disappear. Nil for every other tool.
+		if err := inst.PromptDeliveryError(); err != nil {
+			h.setError(err)
 			return h, nil
 		}
 		text := msg.text
@@ -6809,6 +7055,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return h, tea.Batch(focusCmd, h.tick())
 		}
 
+		// Keep the agents index current so the ⚙ marker and the preview
+		// card reflect live state without the panel being open. Internally
+		// rate-limited, and a no-op when nothing has been adopted.
+		h.refreshAgentsPanel()
+
 		var remoteFetchCmd tea.Cmd
 		var remoteLatencyCmd tea.Cmd
 
@@ -7080,6 +7331,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Handle watcher panel (before settings panel)
+		if h.agentsPanel.IsVisible() {
+			var cmd tea.Cmd
+			h.agentsPanel, cmd = h.agentsPanel.Update(msg)
+			return h, cmd
+		}
 		if h.watcherPanel.IsVisible() {
 			var cmd tea.Cmd
 			h.watcherPanel, cmd = h.watcherPanel.Update(msg)
@@ -7418,8 +7674,11 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 		// does not own. Only the identity half applies: the user's explicit
 		// pick must not be downgraded to a fresh session by the
 		// conversation-data heuristics.
+		//
+		// exec so the agent replaces the wrapper shell and leads the pane,
+		// matching buildClaudeResumeCommand and the fresh-start path
 		if allowed, _ := session.ResumeIdentityAllowed(inst, result.SessionID); allowed {
-			cmdBuilder.WriteString("claude --resume ")
+			cmdBuilder.WriteString("exec claude --resume ")
 			cmdBuilder.WriteString(result.SessionID)
 		} else {
 			freshID := session.NewClaudeSessionUUID()
@@ -7428,7 +7687,7 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 			// other minted-id writer (Instance.replaceRefusedClaudeSessionID,
 			// buildClaudeCommandWithMessage's own mint path).
 			session.MarkClaudeSessionIDVerified(inst)
-			cmdBuilder.WriteString("claude --session-id ")
+			cmdBuilder.WriteString("exec claude --session-id ")
 			cmdBuilder.WriteString(freshID)
 		}
 		if opts.SkipPermissions {
@@ -7989,6 +8248,7 @@ func (h *Home) hasModalVisible() bool {
 		h.setupWizard.IsVisible() || h.settingsPanel.IsVisible() ||
 		(h.toolVisibilityPanel != nil && h.toolVisibilityPanel.IsVisible()) ||
 		h.watcherPanel.IsVisible() || // hotkeyWatcherPanel overlay
+		h.agentsPanel.IsVisible() || // hotkeyAgentsPanel overlay
 		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
 		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.pluginDialog.IsVisible() || h.skillDialog.IsVisible() ||
@@ -8133,6 +8393,8 @@ func (h *Home) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				}
 				h.saveGroupState()
 				h.noteGroupToggled(groupPath)
+			} else if item.Type == session.ItemTypeRemoteGroup {
+				h.toggleRemoteGroup(item.RemoteName, item.Path)
 			}
 			return h, nil
 		}
@@ -8236,16 +8498,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return h.tryQuit()
 
-	case "U":
+	case "esc":
 		// Dismiss the >5-releases-behind update nudge for this session.
-		// Only meaningful when the nudge is actually showing — otherwise
-		// fall through so other "U"-bound paths can handle it.
 		if h.shouldRenderUpdateNudge() {
 			h.handleUpdateNudgeDismiss(msg)
 			return h, nil
 		}
-
-	case "esc":
 		// Dismiss maintenance banner if visible
 		if h.maintenanceMsg != "" {
 			h.maintenanceMsg = ""
@@ -8510,6 +8768,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				h.saveGroupState()
 				h.noteGroupToggled(groupPath)
+			} else if item.Type == session.ItemTypeRemoteGroup {
+				// Enter on a remote header folds it, mirroring local groups.
+				// There is nothing to attach to on a header row.
+				h.toggleRemoteGroup(item.RemoteName, item.Path)
 			} else if item.Type == session.ItemTypeWindow {
 				// Find parent session by WindowSessionID
 				var parentInst *session.Instance
@@ -8572,6 +8834,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				h.saveGroupState()
 				h.noteGroupToggled(groupPath)
+			} else if item.Type == session.ItemTypeRemoteGroup {
+				h.toggleRemoteGroup(item.RemoteName, item.Path)
 			} else if item.Type == session.ItemTypeSession && h.sessionHasWindows(item) {
 				sid := item.Session.ID
 				h.windowsCollapsed[sid] = !h.windowsCollapsed[sid]
@@ -8591,6 +8855,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			switch item.Type {
+			case session.ItemTypeRemoteSession, session.ItemTypeRemoteGroup:
+				// #1875: remote rows are not Instances in groupTree, so they
+				// carry a local order overlay instead. Returning here also
+				// skips the forceSaveInstances below, which has nothing to do
+				// with a remote reorder.
+				h.moveRemoteItem(item, -1)
+				return h, nil
 			case session.ItemTypeGroup:
 				h.groupTree.MoveGroupUp(item.Path)
 				h.rebuildFlatItems()
@@ -8624,6 +8895,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			switch item.Type {
+			case session.ItemTypeRemoteSession, session.ItemTypeRemoteGroup:
+				// #1875 — see the shift+up twin above.
+				h.moveRemoteItem(item, 1)
+				return h, nil
 			case session.ItemTypeGroup:
 				h.groupTree.MoveGroupDown(item.Path)
 				h.rebuildFlatItems()
@@ -9004,6 +9279,18 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.refreshWatcherPanel()
 		h.watcherPanel.Show()
 		h.watcherPanel.SetSize(h.width, h.height)
+		return h, nil
+
+	case defaultHotkeyBindings[hotkeyAgentsPanel]:
+		// Open the Agents tab. Opt-in by presence: with nothing adopted there
+		// is no panel to open and the key stays inert, so a zero-config deck
+		// is unchanged.
+		h.refreshAgentsPanel()
+		if !h.agentsPanel.HasAgents() && h.agentsLoadError == "" {
+			return h, nil
+		}
+		h.agentsPanel.Show()
+		h.agentsPanel.SetSize(h.width, h.height)
 		return h, nil
 
 	case "E":
@@ -9449,6 +9736,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return h, h.restartSession(item.Session)
 				}
 			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
+				restartID := remoteRestartAnimationID(item.RemoteName, item.RemoteSession.ID)
+				if _, restarting := h.remoteRestarting[restartID]; restarting {
+					h.setError(fmt.Errorf("remote session is restarting, please wait..."))
+					return h, nil
+				}
+				h.remoteRestarting[restartID] = struct{}{}
+				h.resumingSessions[restartID] = time.Now()
 				return h, h.restartRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
 			}
 		}
@@ -9678,14 +9972,18 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.rebuildFlatItems()
 		return h, nil
 
-	case "$", "shift+4":
-		// Cost dashboard (when cost tracking is active), otherwise filter to error sessions
-		if h.costStore != nil {
-			h.showCostDashboard = true
-			h.costDashboard = newCostDashboard(h.costStore, h.width, h.height)
+	case CostDashboardKey, "shift+4":
+		// Cost dashboard (when cost tracking is active).
+		if h.costStore == nil {
+			h.setError(fmt.Errorf("Cost Dashboard unavailable: state database is missing; restart agent-deck with a writable config directory to enable it"))
 			return h, nil
 		}
-		// Fallback: filter to error sessions only
+		h.showCostDashboard = true
+		h.costDashboard = newCostDashboard(h.costStore, h.width, h.height)
+		return h, nil
+
+	case FilterKeyError, "shift+7":
+		// Filter to error sessions only.
 		if h.statusFilter == session.StatusError {
 			h.statusFilter = "" // Toggle off
 		} else {
@@ -9771,16 +10069,28 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case ConfirmInstallHooks:
+	case ConfirmInstallHooks, ConfirmInstallHermesHooks:
 		switch msg.String() {
 		case "y", "Y":
+			if h.confirmDialog.GetConfirmType() == ConfirmInstallHermesHooks {
+				return h, h.confirmInstallHermesHooks()
+			}
 			return h, h.confirmInstallHooks()
 		case "enter":
 			if h.confirmDialog.GetFocusedButton() == 0 {
+				if h.confirmDialog.GetConfirmType() == ConfirmInstallHermesHooks {
+					return h, h.confirmInstallHermesHooks()
+				}
 				return h, h.confirmInstallHooks()
+			}
+			if h.confirmDialog.GetConfirmType() == ConfirmInstallHermesHooks {
+				return h, h.declineInstallHermesHooks()
 			}
 			return h, h.declineInstallHooks()
 		case "n", "N", "esc":
+			if h.confirmDialog.GetConfirmType() == ConfirmInstallHermesHooks {
+				return h, h.declineInstallHermesHooks()
+			}
 			return h, h.declineInstallHooks()
 		}
 		return h, nil
@@ -9922,6 +10232,7 @@ func (h *Home) confirmInstallHooks() tea.Cmd {
 	if db := statedb.GetGlobal(); db != nil {
 		_ = db.SetMeta("hooks_prompted", "accepted")
 	}
+	h.showPendingHooksPrompt()
 	return nil
 }
 
@@ -9933,6 +10244,51 @@ func (h *Home) declineInstallHooks() tea.Cmd {
 	if db := statedb.GetGlobal(); db != nil {
 		_ = db.SetMeta("hooks_prompted", "declined")
 	}
+	h.showPendingHooksPrompt()
+	return nil
+}
+
+func (h *Home) showPendingHooksPrompt() {
+	if h.pendingHooksPrompt {
+		h.confirmDialog.ShowInstallHooks()
+	} else if h.pendingHermesHooksPrompt {
+		h.confirmDialog.ShowInstallHermesHooks(filepath.Join(session.GetHermesConfigDir(), "config.yaml"), session.HermesHookEventsForInstall())
+	} else {
+		return
+	}
+	h.confirmDialog.SetSize(h.width, h.height)
+}
+
+func (h *Home) confirmInstallHermesHooks() tea.Cmd {
+	h.confirmDialog.Hide()
+	h.pendingHermesHooksPrompt = false
+	configDir := session.GetHermesConfigDir()
+	if _, err := session.InjectHermesHooks(configDir); err != nil {
+		uiLog.Warn("hermes_hooks_install_failed", slog.String("error", err.Error()))
+		return nil
+	}
+	if db := statedb.GetGlobal(); db != nil {
+		_ = db.SetMeta("hermes_hooks_prompted", "accepted")
+	}
+	if h.hookWatcher == nil {
+		if hookWatcher, err := session.NewStatusFileWatcher(nil); err != nil {
+			uiLog.Warn("hook_watcher_init_failed", slog.String("error", err.Error()))
+		} else {
+			h.hookWatcher = hookWatcher
+			go hookWatcher.Start()
+		}
+	}
+	h.showPendingHooksPrompt()
+	return nil
+}
+
+func (h *Home) declineInstallHermesHooks() tea.Cmd {
+	h.confirmDialog.Hide()
+	h.pendingHermesHooksPrompt = false
+	if db := statedb.GetGlobal(); db != nil {
+		_ = db.SetMeta("hermes_hooks_prompted", "declined")
+	}
+	h.showPendingHooksPrompt()
 	return nil
 }
 
@@ -10209,7 +10565,11 @@ func conductorComposerGuardOptions() send.ComposerGuardOptions {
 // to prevent; the saved draft is logged instead.
 func deliverToConductorPaneGuarded(p guardableConductorPane, msg string, guardOpts send.ComposerGuardOptions, maxChecks int, checkDelay time.Duration) error {
 	guard := send.GuardComposerDraft(p, guardOpts)
-	err := deliverToConductorPaneTuned(p, msg, maxChecks, checkDelay)
+	// guard.ComposerPasteMarkerFree is the #1777 provenance the verify loop
+	// needs: the guard's pre-send capture saw a composer with no
+	// "[Pasted text …]" marker, so a marker seen during verification is the
+	// collapsed rendering of OUR framed multi-line payload (issue #1855).
+	err := deliverToConductorPaneAttributed(p, msg, guard.ComposerPasteMarkerFree, maxChecks, checkDelay)
 	if guard.SavedDraft != "" {
 		if err == nil {
 			// Delivery confirmed: type the operator draft back. If the
@@ -10252,12 +10612,26 @@ type guardableConductorPane interface {
 // has since gone idle) is not spammed with empty submissions.
 const blindEnterCap = 3
 
-// deliverToConductorPaneTuned is deliverToConductorPane with the verify budget
-// exposed for tests; production callers use the default budget (~10s).
+// deliverToConductorPaneTuned is deliverToConductorPaneAttributed without
+// pre-send provenance: a paste marker in the composer counts as foreign —
+// never nudged, never read as submitted. Kept for callers with no guard
+// capture to attribute against.
 func deliverToConductorPaneTuned(p conductorPane, msg string, maxChecks int, checkDelay time.Duration) error {
+	return deliverToConductorPaneAttributed(p, msg, false, maxChecks, checkDelay)
+}
+
+// deliverToConductorPaneAttributed is deliverToConductorPane with the verify
+// budget exposed for tests and the #1777 paste-marker provenance explicit;
+// production callers use the default budget (~10s). ownPasteMarker carries
+// the caller's pre-send observation that the composer held no "[Pasted text …]"
+// marker, which is what makes a marker seen during verification attributable
+// to this delivery's own bracketed-paste collapse (issue #1855) rather than
+// to a foreign paste parked in the composer.
+func deliverToConductorPaneAttributed(p conductorPane, msg string, ownPasteMarker bool, maxChecks int, checkDelay time.Duration) error {
 	if err := p.SendKeysAndEnter(msg); err != nil {
 		return err
 	}
+	attrib := send.EnterAttribution{Message: msg, OwnPasteMarker: ownPasteMarker}
 	sawUnsent := false
 	blindEnters := 0
 	for i := 0; i < maxChecks; i++ {
@@ -10286,6 +10660,21 @@ func deliverToConductorPaneTuned(p conductorPane, msg string, maxChecks int, che
 			sawUnsent = true
 			if err := p.SendEnter(); err != nil {
 				return fmt.Errorf("retry enter: %w", err)
+			}
+		case send.ComposerHoldsPasteMarker(raw, tmux.StripANSI):
+			// The composer holds a "[Pasted text …]" marker instead of the
+			// message body. Since the transport frames every multi-line
+			// payload as a bracketed paste (issue #1855), this is the NORMAL
+			// delivered-but-unsubmitted shape of our own send — but only
+			// provenance can say so, because the marker hides the content.
+			// NudgeEnter presses Enter only when the collapse is attributable
+			// (ownPasteMarker, or a pane with no composer introspection);
+			// otherwise it withholds, this case confirms nothing, and the
+			// loop times out honestly instead of the old behavior of falling
+			// through to "a composer is rendered without our message" and
+			// reporting an unsent message as submitted.
+			if attrib.NudgeEnter(p, send.Captured(raw), tmux.StripANSI) {
+				sawUnsent = true
 			}
 		case sawUnsent || send.HasCurrentComposerPrompt(content):
 			// The composer previously held the message and is now clear, or a
@@ -11254,6 +11643,58 @@ func (h *Home) saveInstancesWithForce(force bool) {
 	}
 }
 
+// adoptRestartRecord accounts for the targeted write Instance.restart makes when
+// it records what a restart produced.
+//
+// That write moves the state DB's last_modified. This TUI's freshness marker
+// does not move with it, so the save that follows a restart would read the
+// TUI's OWN write as an external change, abort, and reload -- discarding the
+// rest of the restart's in-memory state (sandbox container, tool session ids,
+// the dedup pass) for no reason. That self-inflicted false positive is what
+// #1868 was really hitting.
+//
+// The marker is advanced only when the restart's write was the sole change
+// since this TUI loaded: nothing landed between the load and the write, and
+// nothing has landed since. Anything else means the database really has moved
+// on, the abort is correct, and it stays -- the reload picks up what the other
+// process wrote, and the restart's own outcome is durable either way because
+// the targeted write already landed.
+//
+// last_modified is a UnixNano stamp, so this is an exact identity test on our
+// own write rather than a time window that could swallow somebody else's.
+func (h *Home) adoptRestartRecord(sessionID string) {
+	if h.storage == nil {
+		return
+	}
+	inst := h.getInstanceByID(sessionID)
+	if inst == nil {
+		return
+	}
+	stamps := inst.RestartRecordStamps()
+	if stamps.After == 0 {
+		return
+	}
+	current, err := h.storage.GetFileMtime()
+	if err != nil || current.IsZero() {
+		return
+	}
+
+	h.reloadMu.Lock()
+	defer h.reloadMu.Unlock()
+	if !stamps.SoleWriterSince(h.lastLoadMtime.UnixNano(), current.UnixNano()) {
+		uiLog.Debug("restart_record_not_sole_writer",
+			slog.Int64("before", stamps.Before),
+			slog.Int64("after", stamps.After),
+			slog.Int64("current", current.UnixNano()))
+		return
+	}
+	h.lastLoadMtime = current
+	if h.storageWatcher != nil {
+		// Our own bump should not make the watcher schedule a reload either.
+		h.storageWatcher.NotifySave()
+	}
+}
+
 // deleteGroupRows removes a group and its descendants from the groups table.
 // SaveGroups is additive (upsert, never prune), so an intentional removal —
 // delete or the old path of a rename/move — must be persisted explicitly here,
@@ -11280,19 +11721,47 @@ func (h *Home) saveGroupState() {
 }
 
 // saveUIState persists cursor position, preview mode, and status filter to SQLite metadata.
+// Failures are logged only; use saveUIStateErr when the caller has to tell the
+// user that their action did not stick.
 func (h *Home) saveUIState() {
+	_ = h.saveUIStateErr()
+}
+
+// saveUIStateErr is saveUIState with the write outcome returned.
+//
+// The periodic and incidental callers do not care — a dropped autosave is
+// recoverable on the next tick. An explicit user action does care: #1875 exists
+// because a remote row silently swallowed a keystroke, and "the rows moved but
+// the order was never written" is the same lie one layer down. A nil storage or
+// DB is not a failure: that is the headless/no-persistence configuration, not a
+// write that went wrong.
+func (h *Home) saveUIStateErr() error {
 	if h.storage == nil {
-		return
+		return nil
 	}
 	db := h.storage.GetDB()
 	if db == nil {
-		return
+		return nil
 	}
 
 	state := uiState{
-		PreviewMode:   int(h.previewMode),
-		StatusFilter:  string(h.statusFilter),
-		GroupViewMode: int(h.groupViewMode),
+		PreviewMode:        int(h.previewMode),
+		StatusFilter:       string(h.statusFilter),
+		GroupViewMode:      int(h.groupViewMode),
+		RemoteSessionOrder: h.remoteSessionOrder,
+	}
+
+	// Sorted so an unchanged fold state marshals byte-identically and doesn't
+	// churn the metadata row on every save.
+	if len(h.remoteGroupsCollapsed) > 0 {
+		paths := make([]string, 0, len(h.remoteGroupsCollapsed))
+		for path, isCollapsed := range h.remoteGroupsCollapsed {
+			if isCollapsed {
+				paths = append(paths, path)
+			}
+		}
+		sort.Strings(paths)
+		state.RemoteGroupsCollapsed = paths
 	}
 
 	// Capture cursor position
@@ -11313,11 +11782,13 @@ func (h *Home) saveUIState() {
 	data, err := json.Marshal(state)
 	if err != nil {
 		uiLog.Warn("save_ui_state_marshal_failed", slog.String("error", err.Error()))
-		return
+		return err
 	}
 	if err := db.SetMeta("ui_state", string(data)); err != nil {
 		uiLog.Warn("save_ui_state_failed", slog.String("error", err.Error()))
+		return err
 	}
+	return nil
 }
 
 // loadUIState reads persisted UI state from SQLite metadata.
@@ -11343,12 +11814,33 @@ func (h *Home) loadUIState() {
 		return
 	}
 
+	// Remote fold state applies immediately: rebuildFlatItems reads the map on
+	// the first paint, before any remote sessions have even been fetched.
+	if h.remoteGroupsCollapsed == nil {
+		h.remoteGroupsCollapsed = make(map[string]bool)
+	}
+	for _, path := range state.RemoteGroupsCollapsed {
+		h.remoteGroupsCollapsed[path] = true
+	}
+
 	// Apply preview mode, status filter, and group view mode immediately
 	h.previewMode = PreviewMode(state.PreviewMode)
 	h.statusFilter = session.Status(state.StatusFilter)
 	h.groupViewMode = session.GroupViewMode(state.GroupViewMode)
 	if h.groupViewMode < session.GroupViewNormal || h.groupViewMode >= session.GroupViewModeCount {
 		h.groupViewMode = session.GroupViewNormal
+	}
+
+	// #1875: restore the manual remote row order. Entries for remotes that no
+	// longer exist are harmless — a bucket key nobody builds is never read —
+	// and stale session IDs inside a live bucket are skipped when applied.
+	h.remoteSessionOrder = make(remoteOrder, len(state.RemoteSessionOrder))
+	for remoteName, groups := range state.RemoteSessionOrder {
+		for groupPath, ids := range groups {
+			if len(ids) > 0 {
+				h.remoteSessionOrder.set(remoteName, groupPath, ids)
+			}
+		}
 	}
 
 	// Defer cursor restoration until flatItems are populated
@@ -11682,7 +12174,7 @@ func createSessionTool(command string) (string, string) {
 		tool = "crush"
 	case "cursor":
 		tool = "cursor"
-		command = "cursor agent"
+		command = session.GetToolCommand("cursor")
 	case "hermes":
 		tool = "hermes"
 	default:
@@ -11936,7 +12428,7 @@ func (h *Home) quickCreateSession() tea.Cmd {
 	}
 	if command == "" && tool != "shell" {
 		if tool == "cursor" {
-			command = "cursor agent"
+			command = session.GetToolCommand("cursor")
 		} else {
 			command = tool
 		}
@@ -13098,6 +13590,10 @@ type remoteSessionRestartedMsg struct {
 	err        error
 }
 
+func remoteRestartAnimationID(remoteName, sessionID string) string {
+	return "remote:" + remoteName + ":" + sessionID
+}
+
 type remoteSessionCreatedMsg struct {
 	err error
 }
@@ -13550,6 +14046,121 @@ func (a attachWindowCmd) SetStdin(r io.Reader)  {}
 func (a attachWindowCmd) SetStdout(w io.Writer) {}
 func (a attachWindowCmd) SetStderr(w io.Writer) {}
 
+// moveRemoteItem handles shift+up/down (and the +/-/K/J aliases) on a remote
+// row (#1875). delta is -1 for up and +1 for down.
+//
+// The move rewrites this bucket's entry in the local order overlay and saves
+// it; nothing is sent to the remote. Every path through here either changes
+// the order or reports why it could not, because a silent no-op is the bug
+// being fixed — a remote row that swallows the keystroke is indistinguishable
+// from a stuck key.
+//
+// Remote GROUP headers deliberately do not reorder. buildRemoteFlatItems emits
+// them by walking the bucket paths in lexicographic order, which is what makes
+// a parent header land immediately before its descendants and lets the
+// intermediate headers of "a/b/c" be synthesized on the fly; a manual group
+// order would have to replace that walk with a real tree. Remote groups also
+// have no identity of their own — they exist only as the Group strings of the
+// sessions inside them, so a group with no sessions cannot even be addressed.
+// The header therefore says so instead of going quiet.
+func (h *Home) moveRemoteItem(item session.Item, delta int) {
+	direction := "up"
+	edge := "first"
+	if delta > 0 {
+		direction = "down"
+		edge = "last"
+	}
+
+	if item.Type == session.ItemTypeRemoteGroup {
+		h.setError(fmt.Errorf("cannot move %s: remote group rows are ordered by name — reorder the sessions inside instead", direction))
+		return
+	}
+	if item.RemoteSession == nil || item.RemoteName == "" {
+		h.setError(fmt.Errorf("cannot move %s: this remote session row is malformed", direction))
+		return
+	}
+	moved := item.RemoteSession
+	if moved.ID == "" {
+		h.setError(fmt.Errorf("cannot move '%s' %s: %s did not report an id for it", moved.Title, direction, item.RemoteName))
+		return
+	}
+
+	// The bucket is the one buildRemoteFlatItems put this row in: same remote,
+	// same normalized group path.
+	groupPath := normalizeRemoteGroupPath(moved.Group)
+
+	h.remoteSessionsMu.RLock()
+	fetched := h.remoteSessions[item.RemoteName]
+	natural := make([]string, 0, len(fetched))
+	for i := range fetched {
+		if normalizeRemoteGroupPath(fetched[i].Group) == groupPath {
+			natural = append(natural, fetched[i].ID)
+		}
+	}
+	h.remoteSessionsMu.RUnlock()
+
+	// Empty IDs cannot be represented in the persisted order overlay. A swap
+	// across one would be discarded by applyRemoteSessionOrder on the immediate
+	// rebuild, making a successful-looking move a silent no-op.
+	for _, id := range natural {
+		if id == "" {
+			h.setError(fmt.Errorf("cannot move '%s' %s: %s lists a session without an id in this group, so its order cannot be tracked", moved.Title, direction, item.RemoteName))
+			return
+		}
+	}
+
+	// A bucket whose IDs are not unique cannot be reordered at all:
+	// orderRemoteBucket refuses to permute it, because the slot mapping is no
+	// longer 1:1 and a row could be dropped or doubled. Storing an order for it
+	// would change nothing on screen — a no-op dressed as success, which is the
+	// bug this issue is about. It also makes the row itself ambiguous: two rows
+	// answering to the same ID cannot be told apart. Report it instead.
+	if dup, ok := firstDuplicateID(natural); ok {
+		h.setError(fmt.Errorf("cannot move '%s' %s: %s lists more than one session with id %q in this group, so their order cannot be tracked", moved.Title, direction, item.RemoteName, dup))
+		return
+	}
+
+	// Start from what is actually on screen — the fetched list with the
+	// current overlay already applied — so a move is always relative to what
+	// the user sees, whatever has drifted since the overlay was written.
+	current := applyRemoteSessionOrder(natural, h.remoteSessionOrder.forRemote(item.RemoteName)[groupPath])
+	pos := -1
+	for i, id := range current {
+		if id == moved.ID {
+			pos = i
+			break
+		}
+	}
+	if pos < 0 {
+		h.setError(fmt.Errorf("cannot move '%s' %s: it is no longer listed on %s", moved.Title, direction, item.RemoteName))
+		return
+	}
+
+	target := pos + delta
+	if target < 0 || target >= len(current) {
+		h.setError(fmt.Errorf("'%s' is already %s in its group on %s", moved.Title, edge, item.RemoteName))
+		return
+	}
+	current[pos], current[target] = current[target], current[pos]
+
+	// current lists exactly the sessions present in this bucket right now, so
+	// storing it whole keeps the overlay complete and the next move stable.
+	if h.remoteSessionOrder == nil {
+		h.remoteSessionOrder = make(remoteOrder)
+	}
+	h.remoteSessionOrder.set(item.RemoteName, groupPath, current)
+
+	h.clearError()
+	h.rebuildFlatItemsPreservingSelection(h.captureSelectedItemIdentity())
+
+	// A move that cannot be written is a move that will be gone at the next
+	// launch. Say so: the rows visibly moved, so staying quiet here would be
+	// the same silent lie this issue is about, one layer down.
+	if err := h.saveUIStateErr(); err != nil {
+		h.setError(fmt.Errorf("moved '%s' %s, but the order could not be saved and will not survive a restart: %w", moved.Title, direction, err))
+	}
+}
+
 // attachRemoteSession attaches to a remote session via SSH, suspending the TUI.
 func (h *Home) attachRemoteSession(remoteName, sessionID string) tea.Cmd {
 	config, err := session.LoadUserConfig()
@@ -13933,6 +14544,9 @@ func (h *Home) renderFrame() string {
 	}
 
 	// Watcher panel is modal (before settings panel)
+	if h.agentsPanel.IsVisible() {
+		return h.agentsPanel.View()
+	}
 	if h.watcherPanel.IsVisible() {
 		return h.watcherPanel.View()
 	}
@@ -15131,7 +15745,7 @@ func (h *Home) renderHelpBarWidthAdaptive() string {
 	switch {
 	case h.width < 70:
 		return h.renderHelpBarMinimal()
-	case h.width < 100:
+	case h.width <= 100:
 		return h.renderHelpBarCompact()
 	default:
 		return h.renderHelpBarFull()
@@ -15322,6 +15936,13 @@ func (h *Home) renderHelpBarCompact() string {
 			if key := h.actionKey(hotkeyRestart); key != "" {
 				contextHints = append(contextHints, h.helpKeyShort(key, "Restart"))
 			}
+			// Skills is a primary selected-session action. Keep it ahead of the
+			// rarer optional actions so the width fitter retains it at 100 cols.
+			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
+				if key := h.actionKey(hotkeySkillsManager); key != "" {
+					contextHints = append(contextHints, h.helpKeyShort(key, "Skills"))
+				}
+			}
 			if item.Session != nil && item.Session.CanRestartFresh() && restartFreshKey != "" {
 				contextHints = append(contextHints, h.helpKeyShort(restartFreshKey, "Fresh"))
 			}
@@ -15336,11 +15957,6 @@ func (h *Home) renderHelpBarCompact() string {
 				}
 				if key := h.actionKey(hotkeyTogglePreview); key != "" {
 					contextHints = append(contextHints, h.helpKeyShort(key, h.previewModeShort()))
-				}
-			}
-			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
-				if key := h.actionKey(hotkeySkillsManager); key != "" {
-					contextHints = append(contextHints, h.helpKeyShort(key, "Skills"))
 				}
 			}
 			if key := h.actionKey(hotkeyCopyOutput); key != "" {
@@ -15396,12 +16012,13 @@ func (h *Home) renderHelpBarCompact() string {
 
 	leftPart := strings.Join(contextHints, " ")
 	rightPart := globalHints
-	padding := h.width - lipgloss.Width(leftPart) - lipgloss.Width(rightPart) - 4
-	if padding < 2 {
-		// Content too wide for one line — drop right part to avoid overflow
-		padding = 2
-		rightPart = ""
+	// Drop lowest-priority context hints as whole units. MaxWidth alone can
+	// truncate a label (notably "Skills") halfway through at exactly 100 cols.
+	for len(contextHints) > 0 && lipgloss.Width(leftPart)+lipgloss.Width(rightPart)+6 > h.width {
+		contextHints = contextHints[:len(contextHints)-1]
+		leftPart = strings.Join(contextHints, " ")
 	}
+	padding := max(2, h.width-lipgloss.Width(leftPart)-lipgloss.Width(rightPart)-4)
 
 	content := leftPart + sep + strings.Repeat(" ", padding) + rightPart
 
@@ -16055,15 +16672,34 @@ func (h *Home) buildGroupRenderStats(snapshot map[string]sessionRenderState) map
 		return stats
 	}
 
+	// #1987: count the partition being rendered, not the whole slice. A group's
+	// Sessions holds active and archived rows together while the deck renders
+	// exactly one partition at a time (rebuildFlatItems keeps only the rows whose
+	// IsArchived matches the current view), so a raw len() reports sessions the
+	// header is not heading — `demo (5)` above two rows, or `My Sessions (180)`
+	// above 19. The running/waiting tallies are wrong for a second reason that
+	// the same filter fixes: archiving does not reset Status and the status
+	// updater skips archived sessions (see shouldPollStatusInLoop), so an archived
+	// session contributes whatever it was doing when it was archived, forever.
+	//
+	// The rule is partition-aware rather than archive-excluding: in the archived
+	// view (^) the header must count archived rows, because those are the rows
+	// underneath it. Same shape as SameArchivePartition in the reorder path.
+	viewArchived := h.statusFilter == FilterModeArchived
+
 	for path, g := range h.groupTree.Groups {
 		if g == nil {
 			continue
 		}
 
-		directSessions := len(g.Sessions)
+		directSessions := 0
 		directRunning := 0
 		directWaiting := 0
 		for _, sess := range g.Sessions {
+			if sess.IsArchived() != viewArchived {
+				continue
+			}
+			directSessions++
 			state, ok := snapshot[sess.ID]
 			status := sess.Status
 			if ok {
@@ -16537,6 +17173,22 @@ func (h *Home) renderSessionItem(
 		sshBadge = sshStyle.Render(" [ssh:" + host + "]")
 	}
 
+	// Agent marker for a session owned by an adopted agent.
+	//
+	// Deliberately one glyph and nothing more. The role, its version, its
+	// triggers and its connector health belong in the preview panel's agent
+	// card, where there is room to be honest about them; crowding them onto
+	// the row would cost the scannability the list depends on. A deck with
+	// nothing adopted has an empty index, so no marker renders at all.
+	agentBadge := ""
+	if _, owned := h.agentRowForSession(inst.ID); owned {
+		agStyle := lipgloss.NewStyle().Foreground(ColorCyan)
+		if selected {
+			agStyle = SessionStatusSelStyle
+		}
+		agentBadge = agStyle.Render(" ⚙")
+	}
+
 	// Last-update timestamp badge — see pickBadgeTime for the formula.
 	// Selected rows reuse the selection-bar style instead of dim, so the
 	// badge stays legible inside the highlight.
@@ -16551,7 +17203,7 @@ func (h *Home) renderSessionItem(
 			hookStatus = h.hookWatcher.GetHookStatus(inst.ID)
 		}
 		confirmedTs, confirmedObserved := inst.LastObservedActivity()
-		ts := pickBadgeTime(inst.CreatedAt, inst.LastStartedAt, hookStatus, confirmedTs, confirmedObserved)
+		ts := sessionActivityTime(inst.CreatedAt, inst.LastStartedAt, inst.LastActivityAt(), inst.LastAccessedAt, confirmedTs, confirmedObserved, hookStatus)
 		timestampBadge = tsStyle.Render(" " + formatRelativeTime(ts))
 	}
 
@@ -16599,7 +17251,7 @@ func (h *Home) renderSessionItem(
 			cellWidth(status) + 1 /* space before title */ + cellWidth(tool) +
 			cellWidth(maestroBadge) + cellWidth(yoloBadge) + cellWidth(worktreeBadge) +
 			cellWidth(sandboxBadge) + cellWidth(multiRepoBadge) + cellWidth(sshBadge) +
-			cellWidth(timestampBadge)
+			cellWidth(agentBadge) + cellWidth(timestampBadge)
 		budget := listWidth - reserved - 1 // -1 trailing margin
 		if budget > 0 && cellWidth(displayTitle) > budget {
 			displayTitle = cellTruncate(displayTitle, budget, "…")
@@ -16611,7 +17263,7 @@ func (h *Home) renderSessionItem(
 	// The leading gutter (leftGutterWidth) keeps sessions aligned with group
 	// rows, which reserve the same gutter for root hotkey numbers.
 	row := fmt.Sprintf(
-		"%s%s%s%s%s%s %s%s%s%s%s%s%s%s%s",
+		"%s%s%s%s%s%s %s%s%s%s%s%s%s%s%s%s",
 		strings.Repeat(" ", leftGutterWidth),
 		baseIndent,
 		selectionPrefix,
@@ -16626,6 +17278,7 @@ func (h *Home) renderSessionItem(
 		sandboxBadge,
 		multiRepoBadge,
 		sshBadge,
+		agentBadge,
 		timestampBadge,
 	)
 
@@ -16764,20 +17417,14 @@ func (h *Home) renderRemotePreview(item session.Item, width, height int) string 
 	b.WriteString(nameStyle.Render(rs.Title))
 	b.WriteString("  ")
 
-	statusColor := ColorTextDim
-	statusIcon := "○"
-	switch rs.Status {
-	case "running":
-		statusIcon = "●"
-		statusColor = ColorGreen
-	case "waiting":
-		statusIcon = "◐"
-		statusColor = ColorYellow
-	case "error":
-		statusIcon = "✗"
-		statusColor = ColorRed
+	statusIcon, statusStyle := remoteRowStatusGlyph(rs.Status, rs.Substate, rs.Archived)
+	// The archived override swaps the glyph to ■ regardless of the stale live
+	// Status, so the label has to follow it or the row reads "■ running".
+	statusLabel := rs.Status
+	if rs.Archived {
+		statusLabel = "archived"
 	}
-	b.WriteString(lipgloss.NewStyle().Foreground(statusColor).Render(statusIcon + " " + rs.Status))
+	b.WriteString(statusStyle.Render(statusIcon + " " + statusLabel))
 	b.WriteString("\n\n")
 
 	dimStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
@@ -16839,6 +17486,9 @@ func (h *Home) renderRemoteGroupItem(b *strings.Builder, item session.Item, sele
 	nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true) // yellow
 	countStyle := DimStyle
 	expandIcon := "▾"
+	if h.isRemoteGroupCollapsed(item.Path) {
+		expandIcon = "▸" // same glyph pair the local group rows use
+	}
 	if selected {
 		nameStyle = GroupNameSelStyle
 		countStyle = GroupCountSelStyle
@@ -16852,6 +17502,7 @@ func (h *Home) renderRemoteGroupItem(b *strings.Builder, item session.Item, sele
 		sessions := h.remoteSessions[item.RemoteName]
 		groupPath := strings.TrimPrefix(item.Path, "remotes/"+item.RemoteName+"/")
 		count := remoteSubGroupCount(sessions, groupPath)
+		running, waiting := remoteStatusCounts(sessions, groupPath)
 		h.remoteSessionsMu.RUnlock()
 
 		segName := groupPath
@@ -16859,12 +17510,13 @@ func (h *Home) renderRemoteGroupItem(b *strings.Builder, item session.Item, sele
 			segName = groupPath[idx+1:]
 		}
 
-		b.WriteString(fmt.Sprintf("%s%s%s %s%s\n",
+		b.WriteString(fmt.Sprintf("%s%s%s %s%s%s\n",
 			remoteRowGutter(selected),        // align with group hotkey gutter
 			strings.Repeat("  ", item.Level), // nest under the remote header
 			expandIcon,
 			nameStyle.Render(segName),
 			countStyle.Render(fmt.Sprintf(" (%d)", count)),
+			remoteStatusSuffix(running, waiting),
 		))
 		return
 	}
@@ -16872,18 +17524,41 @@ func (h *Home) renderRemoteGroupItem(b *strings.Builder, item session.Item, sele
 	// Level 0: the remote host header. Count all sessions for this remote.
 	h.remoteSessionsMu.RLock()
 	count := 0
+	running, waiting := 0, 0
 	if sessions, ok := h.remoteSessions[item.RemoteName]; ok {
 		count = len(sessions)
+		running, waiting = remoteStatusCounts(sessions, "")
 	}
+	fromCache := h.remoteFromCache[item.RemoteName]
 	h.remoteSessionsMu.RUnlock()
 
-	b.WriteString(fmt.Sprintf("%s%s %s%s%s\n",
+	trailer := h.renderRemoteLatencyMarker(item.RemoteName, selected)
+	if fromCache {
+		// Honest staleness: this is the startup snapshot, not live state yet.
+		trailer = " " + DimStyle.Render("— cached, refreshing…")
+	}
+
+	b.WriteString(fmt.Sprintf("%s%s %s%s%s%s\n",
 		remoteRowGutter(selected), // align with group hotkey gutter (flush with local root groups)
 		expandIcon,
 		nameStyle.Render("remotes/"+item.RemoteName),
 		countStyle.Render(fmt.Sprintf(" (%d)", count)),
-		h.renderRemoteLatencyMarker(item.RemoteName, selected),
+		remoteStatusSuffix(running, waiting),
+		trailer,
 	))
+}
+
+// remoteStatusSuffix renders the same running/waiting glyph counts local
+// group headers show, for remote host and sub-group headers.
+func remoteStatusSuffix(running, waiting int) string {
+	out := ""
+	if running > 0 {
+		out += " " + GroupStatusRunning.Render(fmt.Sprintf("● %d", running))
+	}
+	if waiting > 0 {
+		out += " " + GroupStatusWaiting.Render(fmt.Sprintf("◐ %d", waiting))
+	}
+	return out
 }
 
 // renderRemoteLatencyMarker returns the colored ` — Xms` (or ` — offline`)
@@ -16935,24 +17610,7 @@ func (h *Home) renderRemoteSessionItem(b *strings.Builder, item session.Item, se
 		return
 	}
 
-	statusIcon := "○"
-	statusColor := lipgloss.Color("8") // gray
-	switch rs.Status {
-	case "running":
-		statusIcon = "●"
-		statusColor = lipgloss.Color("2") // green
-	case "waiting":
-		statusIcon = "◉"
-		statusColor = lipgloss.Color("3") // yellow
-	case "idle":
-		statusIcon = "○"
-		statusColor = lipgloss.Color("8")
-	case "error":
-		statusIcon = "✗"
-		statusColor = lipgloss.Color("1") // red
-	}
-
-	sStyle := lipgloss.NewStyle().Foreground(statusColor)
+	statusIcon, sStyle := remoteRowStatusGlyph(rs.Status, rs.Substate, rs.Archived)
 	titleStyle := lipgloss.NewStyle().Foreground(ColorText)
 	if selected {
 		sStyle = SessionStatusSelStyle
@@ -17499,11 +18157,17 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	b.WriteString(infoStyle.Render("📁 " + pathStr))
 	b.WriteString("\n")
 
-	// Activity time - shows when session was last active. Uses the display-
-	// oriented accessor so sessions with no confirmed activity (error/idle/
-	// stopped) fall back to the persisted last-accessed time — matching the
-	// web — instead of leaking the tmux tracker's ~load-time seed.
-	activityTime := selected.DisplayLastActivityTime()
+	// Activity time - shows when session was last active. Composed with
+	// sessionActivityTime — the SAME formula as the row badge (issue #1846:
+	// the preview used to read DisplayLastActivityTime while the badge used
+	// pickBadgeTime, so the two surfaces showed different ages for the same
+	// session; both were stale once the underlying evidence was destroyed).
+	var previewHookStatus *session.HookStatus
+	if h.hookWatcher != nil {
+		previewHookStatus = h.hookWatcher.GetHookStatus(selected.ID)
+	}
+	confirmedTs, confirmedObserved := selected.LastObservedActivity()
+	activityTime := sessionActivityTime(selected.CreatedAt, selected.LastStartedAt, selected.LastActivityAt(), selected.LastAccessedAt, confirmedTs, confirmedObserved, previewHookStatus)
 	activityStr := formatRelativeTime(activityTime)
 	if selectedStatus == session.StatusRunning {
 		activityStr = "active now"
@@ -17525,6 +18189,15 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	b.WriteString(" ")
 	b.WriteString(groupBadge)
 	b.WriteString("\n")
+
+	// Agent card. When the selected session belongs to an adopted agent, its
+	// role, triggers, connector health and recent ledger entries render here
+	// — high in the preview, where there is room to be accurate — instead of
+	// being crushed into the session row, which carries only the ⚙ marker.
+	// Sessions with no agent, and decks with nothing adopted, render nothing.
+	if agentRow, owned := h.agentRowForSession(selected.ID); owned {
+		b.WriteString(h.renderAgentCard(agentRow, width))
+	}
 
 	// Worktree info section (for sessions running in git worktrees)
 	if selected.IsWorktree() {
@@ -18102,6 +18775,11 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
 
 		b.WriteString(warnStyle.Render("✕ No tmux session running"))
+		if restartKey := h.actionKey(hotkeyRestart); restartKey != "" {
+			b.WriteString("   ")
+			b.WriteString(keyStyle.Render(restartKey))
+			b.WriteString(dimStyle.Render(" Restart"))
+		}
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("This can happen if:"))
 		b.WriteString("\n")
@@ -18113,12 +18791,6 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("Actions:"))
 		b.WriteString("\n")
-		if restartKey := h.actionKey(hotkeyRestart); restartKey != "" {
-			b.WriteString("  ")
-			b.WriteString(keyStyle.Render(restartKey))
-			b.WriteString(dimStyle.Render(" Start   - create and start tmux session"))
-			b.WriteString("\n")
-		}
 		if selected.CanRestartFresh() {
 			if restartFreshKey := h.actionKey(hotkeyRestartFresh); restartFreshKey != "" {
 				b.WriteString("  ")
@@ -18762,14 +19434,19 @@ func truncatePath(path string, maxLen int) string {
 	return string(runes[:startLen]) + "..." + string(runes[len(runes)-endLen:])
 }
 
-// pickBadgeTime returns the most recent of the four signals the session-row
+// pickBadgeTime returns the most recent of the five signals the session-row
 // timestamp badge layers over, ignoring any signal that is unset / not
-// observed. Pure function — kept out of renderSessionItem so the 4-layer
+// observed. Pure function — kept out of renderSessionItem so the 5-layer
 // composition can be unit-tested without faking renderer dependencies.
 //
+// lastActivityAt is the durable record from tool_data.last_activity_at
+// (issue #1846): hook-evidenced activity that survives attach-return
+// deleting the hook file and TUI restarts losing the tmux tracker.
+//
 // LastAccessedAt is deliberately not a parameter: peeking at a quiet
-// session isn't an "update".
-func pickBadgeTime(createdAt, lastStartedAt time.Time, hookEvent *session.HookStatus, confirmedActivity time.Time, confirmedObserved bool) time.Time {
+// session isn't an "update". (sessionActivityTime layers it in as a
+// fallback when no activity evidence exists at all.)
+func pickBadgeTime(createdAt, lastStartedAt time.Time, hookEvent *session.HookStatus, lastActivityAt time.Time, confirmedActivity time.Time, confirmedObserved bool) time.Time {
 	ts := createdAt
 	if lastStartedAt.After(ts) {
 		ts = lastStartedAt
@@ -18777,8 +19454,28 @@ func pickBadgeTime(createdAt, lastStartedAt time.Time, hookEvent *session.HookSt
 	if hookEvent != nil && hookEvent.UpdatedAt.After(ts) {
 		ts = hookEvent.UpdatedAt
 	}
+	if lastActivityAt.After(ts) {
+		ts = lastActivityAt
+	}
 	if confirmedObserved && confirmedActivity.After(ts) {
 		ts = confirmedActivity
+	}
+	return ts
+}
+
+// sessionActivityTime is the single "last activity" composition BOTH the
+// session-row badge and the preview's "⏱" line render from (issue #1846:
+// the two surfaces used different formulas over different stale fallbacks
+// and showed two different wrong ages for the same session).
+//
+// Layering: pickBadgeTime's activity evidence wins outright; LastAccessedAt
+// participates only as a fallback when no evidence beyond CreatedAt exists —
+// a TUI attach is a better floor than creation time, but a peek at a quiet
+// session must never override recorded activity.
+func sessionActivityTime(createdAt, lastStartedAt, lastActivityAt, lastAccessedAt, confirmedActivity time.Time, confirmedObserved bool, hookEvent *session.HookStatus) time.Time {
+	ts := pickBadgeTime(createdAt, lastStartedAt, hookEvent, lastActivityAt, confirmedActivity, confirmedObserved)
+	if ts.Equal(createdAt) && lastAccessedAt.After(ts) {
+		return lastAccessedAt
 	}
 	return ts
 }
@@ -19705,7 +20402,7 @@ func (h *Home) renderFilterBarHint() string {
 		mark("!", h.statusFilter == session.StatusRunning) +
 		mark("@", h.statusFilter == session.StatusWaiting) +
 		mark("#", h.statusFilter == session.StatusIdle) +
-		mark("$", h.statusFilter == session.StatusError) +
+		mark(FilterKeyError, h.statusFilter == session.StatusError) +
 		dim.Render(" filter • ") +
 		mark("0", h.statusFilter == "") +
 		dim.Render(" all • ") +

@@ -15,6 +15,8 @@ Complete reference for all agent-deck CLI commands.
 - [Group Commands](#group-commands)
 - [Profile Commands](#profile-commands)
 - [Remote Commands](#remote-commands)
+- [Codex Hook Commands](#codex-hook-commands)
+- [DeepSeek Commands](#deepseek-commands)
 - [Conductor Commands](#conductor-commands)
 
 ## Global Options
@@ -43,6 +45,8 @@ agent-deck add [path] [options]
 | `--no-parent` | Disable automatic parent linking |
 | `--mcp` | Attach MCP (repeatable) |
 | `--attach` | Start and attach to the session immediately after creating it (requires an interactive terminal; not supported with `--ssh`/`--json`) |
+| `--ssh <user@host>` | Run the session over SSH; this is a destination, not a registered remote name |
+| `--remote-path <absolute-path>` | Working directory on the SSH host; an absolute positional path with `--ssh` is equivalent |
 
 ```bash
 agent-deck add -t "My Project" -c claude .
@@ -59,6 +63,7 @@ Notes:
 - `--parent` and `--no-parent` are mutually exclusive.
 - Explicit `-g/--group` overrides inherited parent group.
 - If `--cmd` contains extra args and no explicit `--wrapper` is provided, agent-deck auto-generates a wrapper to preserve those args.
+- SSH session identity is the SSH destination plus remote working directory. Configure key selection with `IdentityFile`/`Host` in `~/.ssh/config` or use `ssh-agent`; agent-deck has no private-key flag.
 
 ### launch - Create + start (+ optional message)
 
@@ -70,6 +75,7 @@ Examples:
 
 ```bash
 agent-deck launch . -c claude -m "Review this module"
+agent-deck launch . -c claude --account work -m "Review this module"
 agent-deck launch . -g ard -c claude -m "Review dataset"
 agent-deck launch . -c "codex --dangerously-bypass-approvals-and-sandbox"
 agent-deck launch -g book-keeper -c claude   # no path: lands on the group's default_path
@@ -77,6 +83,16 @@ agent-deck launch -g book-keeper -c claude   # no path: lands on the group's def
 
 Notes:
 - `[path]` omitted: resolves the target group's `default_path`, then the global `default_path` config key, then cwd — the same chain as `add` (#1303). An explicit `.` always means the current directory.
+- `--account <name>` selects a named slot from `[profiles.<name>.claude].config_dir` for this session, matching `add --account`.
+- `--account` requires an explicit name. If the next token is another launch flag, launch stops with an error before resolving a fallback account or creating a session; use `--account=<name>` when a name intentionally begins with a dash.
+
+### accounts - List named account slots
+
+```bash
+agent-deck accounts [--json]
+```
+
+Lists profiles that configure a Claude `config_dir`; these names are accepted by `add --account` and `launch --account`.
 
 ### list - List sessions
 
@@ -254,7 +270,15 @@ Setting `account` auto-migrates the Claude conversation into the target account'
 ### session send
 
 ```bash
-agent-deck session send <id|title> "message" [--no-wait] [-q] [--json]
+agent-deck session send <id|title> "message" [--wait|--stream|--no-wait] [-q] [--json]
+agent-deck session send <id|title> --message-file <file|-> [--wait|--stream|--no-wait] [-q] [--json]
+```
+
+Use `--message-file` for long or multiline messages, or `--message-file -` for stdin. Do not combine it with an inline message.
+
+```bash
+git diff | agent-deck session send my-project --message-file -
+agent-deck session send my-project --message-file task.md --wait
 ```
 
 Default behavior:
@@ -281,7 +305,7 @@ approval: that path sends composer text followed by Enter.
 agent-deck session output [id|title] [--json] [-q]
 ```
 
-Get last response from Claude/Gemini session.
+Get the last response from a session. Transcript-backed extraction is tool-dependent; use `--pane` for a raw tmux capture when structured output is unavailable.
 
 ### session set-parent / unset-parent
 
@@ -573,6 +597,8 @@ agent-deck conductor list [--profile <name>]
 
 Manage agent-deck instances running on remote SSH servers. Remote sessions appear alongside local sessions in the TUI and CLI.
 
+Registered remotes are named fleet endpoints. They are separate from the per-session SSH destination used by `agent-deck add --ssh`.
+
 Remote configuration is stored in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`) under the `[remotes]` map.
 
 ### remote add
@@ -612,7 +638,33 @@ Lists all configured remotes. Use `--json` for scripting.
 agent-deck remote sessions [name] [--json]
 ```
 
-Fetches active sessions from all remotes, or from a specific remote if `name` is provided. Displays title, tool, status, and session ID. Use `--json` for scripting.
+Fetches active sessions from all remotes, or from a specific remote if `name` is provided. Displays title, tool, live status, and session ID. Use `--json` for scripting.
+
+In the TUI, remote sessions use the same status indicators and nested group tree as local sessions. Remote headers and groups can be collapsed, and `K`/`J` preserve a manual order within each remote group. A session's location (local or SSH host plus remote path) is part of its identity, so identical titles at different locations do not collide.
+
+### remote drain
+
+```bash
+agent-deck remote drain <name|user@host> [--into <session-id>] [--json]
+```
+
+Pulls the completion and transition records a remote agent-deck instance holds and writes them into **this** machine's inbox, so a conductor that launched workers on another host learns they finished without tmux-scraping or file polling (issue #1948).
+
+Transition notifications are parent-linked, and a `parent_session_id` cannot point across machines — so a remote worker's completion never reaches a conductor on a different host. `remote drain` closes that gap by pulling: the conductor's own command is the delivery event, so there is no delivery handshake, no ack, and nothing to replay.
+
+| Flag | Description |
+| --- | --- |
+| `--into <session-id>` | Local session whose inbox receives the records (default: the calling session, same resolution as `inbox drain self`) |
+| `--json` | Emit `{remote, host, target_session_id, fetched, written, duplicates, records}` for a conductor heartbeat |
+
+- **What it returns.** Completions (from the completion ledger) *and* transitions — including the waiting/error/idle flips of sessions that have no parent on the remote host, which is the normal state for a worker whose conductor is on another machine. Those are kept in a reserved `_unowned` ledger beside the per-parent inboxes; a quota-stalled remote session shows up in a drain because of it. Sessions that opted out with `--no-transition-notify` are never exported.
+- **Read-only on the remote.** It runs the remote's `agent-deck inbox export`, which consumes, truncates and marks nothing. Two conductors draining the same host both receive the records, and the host's own conductor still drains its inbox normally.
+- **Safe to repeat.** Records are written through the inbox's existing fingerprint dedup, so a second drain reports `0 new` and adds no duplicate line. Across a consumption boundary the `turn_fingerprint` consumed ledger collapses a re-pulled record instead.
+- **Records are stored under `<remote>:<child-id>`.** A child id is only unique on the host that minted it — `run-task --child <ID>` takes any string — so two hosts running the same named task would otherwise produce records that destroy each other in the conductor's inbox (every identity rule downstream keys on the child id). The stored id names its host, in the same `<remote>:<session>` spelling the TUI uses for remote sessions.
+- **Honest about failure.** Exit `0` = drained (a reachable remote with nothing pending says so explicitly), `2` = unknown remote / none configured, `3` = the remote could not be reached *or could not read its own records*. Neither an ssh failure nor an unreadable record file on the remote ever reads as "nothing to report".
+- The remote must run a build that has `inbox export`; an older one is reported as a version error pointing at `agent-deck remote update`.
+
+Narrowing a drain to one conductor's children (`--parent <conductor-id>@<host>`) is deferred; it is sugar over this pull.
 
 ### remote attach
 
@@ -650,6 +702,41 @@ agent-deck remote rename dev my-session new-name
 agent-deck remote update          # update all remotes
 agent-deck remote update dev      # update specific remote
 ```
+
+SSH uses OpenSSH host-key verification and `BatchMode=yes`; unknown or changed hosts fail instead of prompting. Authenticate with an SSH agent or configured key and establish trust in `known_hosts` before registering a remote. `remote update` verifies the downloaded archive against the release checksums before deployment.
+
+## Codex Hook Commands
+
+```bash
+agent-deck codex-hooks install
+agent-deck codex-hooks status
+agent-deck codex-hooks uninstall
+```
+
+Codex turn-level status uses its notify hook. Install it once per Codex home; if `CODEX_HOME` is set, use the same environment for installation and Codex sessions.
+
+## DeepSeek Commands
+
+Inspect the DeepSeek Harness (`dsh`) integration. Read-only; every subcommand takes `--json`.
+
+```bash
+agent-deck deepseek status              # resolved binary, version, DSH_HOME, profile, resume/fork support
+agent-deck deepseek profiles            # profiles under $DSH_HOME/profiles, with their bundle layers
+agent-deck deepseek sessions [path]     # dsh sessions recorded for a workspace (default: cwd)
+```
+
+The tool is named for the vendor; the binary it launches is `dsh`
+(`npm install -g @deepseek-ai/dsh`). Launch a session with
+`agent-deck launch -c deepseek`.
+
+`status --json` reports `resume_supported` and `fork_supported` as explicit booleans:
+`dsh` has no fork command, and neither shipped profile (`web`, `headless`) accepts a
+resume flag, so both are false on a default install. Configure with `[deepseek]`
+(`command`, `config_dir` → `DSH_HOME`, `profile`, `patches`, `host`/`port`/
+`trusted_hosts`, `resume_flag`, `extra_args`, `env_file`) and give each account its own
+harness home with `[profiles.<account>.deepseek].config_dir`.
+
+See [docs/tools/deepseek.md](../../../docs/tools/deepseek.md) for the full guide.
 
 ## Session Resolution
 

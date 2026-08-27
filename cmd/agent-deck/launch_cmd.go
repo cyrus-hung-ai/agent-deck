@@ -121,6 +121,7 @@ func handleLaunch(profile string, args []string) {
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume")
 	modelID := fs.String("model", "", "Model ID/version to use for this session (claude, codex, gemini, opencode)")
+	account := fs.String("account", "", "Named account slot (resolves via [profiles.<account>.claude].config_dir; #924)")
 
 	// Socket isolation (v1.7.50+, issue #687). Same semantics as
 	// `agent-deck add --tmux-socket`: overrides `[tmux].socket_name` for
@@ -137,7 +138,8 @@ func handleLaunch(profile string, args []string) {
 		fmt.Println("Combines: add + session start + session send")
 		fmt.Println()
 		fmt.Println("Arguments:")
-		fmt.Println("  [path]    Project directory (default: group default_path, then global default_path, then current directory)")
+		fmt.Println("  [path]    Project directory (default: group default_path, then global default_path,")
+		fmt.Println("            then the group's most recent session path, then current directory)")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -158,12 +160,22 @@ func handleLaunch(profile string, args []string) {
 		fmt.Println("  agent-deck launch . -c claude -w feature/new -b -m \"Start work\"")
 	}
 
+	// Reject an omitted --account value before either reordering pass can bind
+	// the following flag as the account name. Besides swallowing that flag, an
+	// unknown account silently falls through to another credential source, so
+	// this check must happen before any launch or fallback resolution begins.
+	if err := checkFlagValueNotFlag(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Reorder args: move path to end so flags are parsed correctly
 	args = reorderArgsForFlagParsing(args)
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
+	ensureTmuxInPathOrExit()
 
 	quietMode := *quiet || *quietShort
 	out := NewCLIOutput(*jsonOutput, quietMode)
@@ -321,7 +333,7 @@ func handleLaunch(profile string, args []string) {
 	}
 
 	// Load sessions
-	storage, instances, groups, err := loadSessionData(profile)
+	storage, instances, _, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
 		os.Exit(1)
@@ -358,7 +370,12 @@ func handleLaunch(profile string, args []string) {
 		}
 		sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided, inheritParentGroup)
 	} else if !*noParent {
-		parentInstance = resolveAutoParentInstance(instances)
+		var unresolvedParent string
+		parentInstance, unresolvedParent = resolveAutoParentInstanceChecked(instances)
+		if parentInstance == nil && unresolvedParent != "" {
+			out.Error(fmt.Sprintf("automatic parent %q could not be resolved; use --parent with a valid session or --no-parent for an intentional top-level session", unresolvedParent), ErrCodeNotFound)
+			os.Exit(1)
+		}
 		if parentInstance != nil && !parentInstance.IsSubSession() {
 			sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided, inheritParentGroup)
 		} else {
@@ -371,18 +388,45 @@ func handleLaunch(profile string, args []string) {
 		sessionTitle = filepath.Base(path)
 	}
 
-	// Check for duplicate and generate unique title
+	// Check for duplicate and generate unique title.
+	//
+	// Same read-decide-write window `add` has (see handleAdd): the list loaded
+	// above answers "is this (title, location) taken?" and the insert happens
+	// much later, so a concurrent registration can take the pair in between.
+	// The lock covers goroutines and separate processes; the re-read inside it
+	// is what makes the answer current. `launch` has no --ssh flag, so its
+	// location is always local — but it shares the predicate with `add` so the
+	// two can never disagree about what a duplicate is.
 	userProvidedTitle := (mergeFlags(*title, *titleShort) != "")
-	if !userProvidedTitle {
-		sessionTitle = generateUniqueTitle(instances, sessionTitle, path)
-	} else {
-		if isDupe, existingInst := isDuplicateSession(instances, sessionTitle, path); isDupe {
-			out.Error(
-				fmt.Sprintf("session already exists: %s (%s)", existingInst.Title, existingInst.ID),
-				ErrCodeAlreadyExists,
-			)
-			os.Exit(1)
+	launchRegLock, launchRegLockErr := session.AcquireRegistrationLock(profile)
+	if launchRegLockErr != nil {
+		out.Error(fmt.Sprintf("failed to acquire session registration lock: %v", launchRegLockErr), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	releaseLaunchRegistration := func() {
+		if launchRegLock != nil {
+			launchRegLock.Release()
+			launchRegLock = nil
 		}
+	}
+	defer releaseLaunchRegistration()
+	freshInstances, freshGroups, reloadErr := reloadForRegistration(storage)
+	if reloadErr != nil {
+		out.Error(reloadErr.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	instances = freshInstances
+	groups := freshGroups
+
+	launchDecision := decideAddTitle(instances, sessionTitle, localLocation(path), userProvidedTitle)
+	if launchDecision.Duplicate != nil {
+		msg, code := launchDecision.DuplicateError()
+		out.ErrorWithData(msg, code, launchDecision.DuplicateJSONFields())
+		os.Exit(1)
+	}
+	sessionTitle = launchDecision.Title
+	if warning := launchDecision.RenameWarning(); warning != "" && !*jsonOutput && !quietMode {
+		fmt.Fprintln(os.Stderr, warning)
 	}
 
 	// Create new instance
@@ -401,6 +445,12 @@ func handleLaunch(profile string, args []string) {
 		if ts := newInstance.GetTmuxSession(); ts != nil {
 			ts.SocketName = flagSocket
 		}
+	}
+
+	// #2045: launch must preserve the same per-session named account slot as
+	// add. Start-time resolution already consumes Instance.Account.
+	if trimmed := strings.TrimSpace(*account); trimmed != "" {
+		newInstance.Account = trimmed
 	}
 
 	if parentInstance != nil {
@@ -543,6 +593,9 @@ func handleLaunch(profile string, args []string) {
 		out.Error(fmt.Sprintf("failed to save session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+	// The (title, location) pair is now taken in the state db; the start and
+	// attach below must not hold the lock for other registrations.
+	releaseLaunchRegistration()
 
 	// Attach MCPs if specified
 	if len(mcpFlags) > 0 {
@@ -608,7 +661,26 @@ func handleLaunch(profile string, args []string) {
 	throttle.Acquire()
 	defer throttle.Release()
 
-	if initialMessage != "" && !*noWait {
+	// PR #1942 review (P1a): refuse a message the target has no way to receive
+	// BEFORE spawning anything. The DeepSeek web profile serves a browser UI and
+	// has no terminal prompt, so the pane-send paths below would type the prompt
+	// into a server's stdin and report success. Every other tool returns nil.
+	if initialMessage != "" {
+		if err := newInstance.PromptDeliveryError(); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+	}
+
+	// PR #1942 review (P1b): when the prompt rides the command line, --no-wait's
+	// "start now, send asynchronously" shape cannot work — the task IS the
+	// invocation, so a Start() without it launches something the tool rejects
+	// outright. Embed it instead. There is nothing to wait for in that case
+	// either: the process is already answering by the time it exists, so
+	// --no-wait loses nothing.
+	promptRidesArgv := initialMessage != "" && newInstance.PromptRidesCommandLine()
+
+	if initialMessage != "" && (!*noWait || promptRidesArgv) {
 		if err := newInstance.StartWithMessage(initialMessage); err != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
@@ -650,24 +722,29 @@ func handleLaunch(profile string, args []string) {
 	// sendWithRetryTarget pass, run verifyPromptConsumedAfterLaunch to catch
 	// the welcome-screen race where claude eats the first Enter. 10s budget
 	// per window + single retry + stderr warning on persistent no-op.
-	if initialMessage != "" && *noWait {
+	if initialMessage != "" && *noWait && !promptRidesArgv {
 		tmuxSess := newInstance.GetTmuxSession()
 		if tmuxSess != nil {
+			// #1777 provenance probe: a freshly launched session has an
+			// empty composer, so a "[Pasted text …]" marker appearing
+			// during verification is this prompt's own collapse and the
+			// Enter nudge stays attributable. If the probe cannot confirm
+			// that, the gate withholds the nudge. Captured once, before the
+			// send, and shared with the v1.7.64 recovery pass below — a
+			// multi-line prompt collapses behind that marker as its normal
+			// delivered form (#1855), so the recovery retry needs the same
+			// provenance or its attribution gate withholds it forever.
+			pasteFreeBeforeSend := composerPasteFree(tmuxSess)
 			if _, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
-				maxRetries: 8,
-				checkDelay: 150 * time.Millisecond,
-				// #1777 provenance probe: a freshly launched session has an
-				// empty composer, so a "[Pasted text …]" marker appearing
-				// during verification is this prompt's own collapse and the
-				// Enter nudge stays attributable. If the probe cannot confirm
-				// that, the gate withholds the nudge.
-				composerPasteFreeBeforeSend: composerPasteFree(tmuxSess),
+				maxRetries:                  8,
+				checkDelay:                  150 * time.Millisecond,
+				composerPasteFreeBeforeSend: pasteFreeBeforeSend,
 			}); err != nil {
 				out.Error(fmt.Sprintf("failed to send initial message: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
 			}
-			verifyPromptConsumedAfterLaunch(
-				tmuxSess, initialMessage,
+			verifyPromptConsumedAfterLaunchAttributed(
+				tmuxSess, initialMessage, pasteFreeBeforeSend,
 				10*time.Second, 250*time.Millisecond,
 				os.Stderr,
 			)
@@ -733,18 +810,25 @@ func handleLaunch(profile string, args []string) {
 // "right here" meaning (resolved like add's positional arg). When no path is
 // given, the resolution chain matches `add` (#1303): the target group's
 // default_path first, then the global config default_path, then cwd.
+//
+// #1879: only an *explicitly configured* group default_path short-circuits the
+// chain. The group's most-recently-accessed session path is a derived guess and
+// is applied after the global config default_path, not instead of it.
 func resolveLaunchPath(rawPathArg, groupSelector, profile string) (string, error) {
 	if rawPathArg != "" {
 		return resolveAddPath(rawPathArg)
 	}
 
+	var recentSessionPath string
 	if grp := strings.TrimSpace(groupSelector); grp != "" {
 		if storage, instances, groups, err := loadSessionData(profile); err == nil {
 			groupTree := session.NewGroupTreeWithGroups(instances, groups)
-			path := groupTree.DefaultPathForGroup(resolveGroupPathForAdd(groupTree, grp))
+			resolvedGroup := resolveGroupPathForAdd(groupTree, grp)
+			explicitPath, hasExplicit := groupTree.ExplicitDefaultPathForGroup(resolvedGroup)
+			recentSessionPath = groupTree.RecentSessionPathForGroup(resolvedGroup)
 			_ = storage.Close()
-			if path != "" {
-				return path, nil
+			if hasExplicit {
+				return explicitPath, nil
 			}
 		}
 	}
@@ -753,6 +837,10 @@ func resolveLaunchPath(rawPathArg, groupSelector, profile string) (string, error
 		if path := resolveConfiguredDefaultPath(userCfg.DefaultPath); path != "" {
 			return path, nil
 		}
+	}
+
+	if recentSessionPath != "" {
+		return recentSessionPath, nil
 	}
 
 	return os.Getwd()
